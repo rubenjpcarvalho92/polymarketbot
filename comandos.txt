@@ -1,8 +1,0 @@
-# SSH para ligar ao servidor
-ssh -i C:\Users\nessa\.ssh\polymarket_bot root@65.108.244.109
-
-# copiar do pc para o servidor
-scp -i C:\Users\nessa\.ssh\polymarket_bot -r C:\Users\nessa\polymarket-rbi-bot\* root@65.108.244.109:/root/bots/polymarket-rbi-bot/
-
-#editar no servidor
-nano .env
