@@ -76,6 +76,7 @@ class TradingConfig:
     max_spread: float
     min_top_book_depth: float
     default_order_size: float
+    paper_starting_cash: float
 
 
 @dataclass(slots=True)
@@ -85,10 +86,38 @@ class LoggingConfig:
 
 
 @dataclass(slots=True)
+class PositionSizingConfig:
+    mode: str
+    starting_balance: float
+    min_order_size: float
+    max_order_size: float
+    max_exposure_pct: float
+
+    fixed_percent: float
+    fixed_amount: float
+
+    kelly_win_rate: float
+    kelly_reward_ratio: float
+
+    martingale_base_amount: float
+    martingale_multiplier: float
+    martingale_max_steps: int
+
+    anti_martingale_base_amount: float
+    anti_martingale_multiplier: float
+    anti_martingale_max_steps: int
+
+    signal_conf_low_pct: float
+    signal_conf_medium_pct: float
+    signal_conf_high_pct: float
+
+
+@dataclass(slots=True)
 class AppConfig:
     polymarket: PolymarketConfig
     trading: TradingConfig
     logging: LoggingConfig
+    position_sizing: PositionSizingConfig
 
 
 def load_config(dotenv_path: str = ".env") -> AppConfig:
@@ -114,6 +143,7 @@ def load_config(dotenv_path: str = ".env") -> AppConfig:
         max_spread=_get_float("MAX_SPREAD", 0.03),
         min_top_book_depth=_get_float("MIN_TOP_BOOK_DEPTH", 100.0),
         default_order_size=_get_float("DEFAULT_ORDER_SIZE", 10.0),
+        paper_starting_cash=_get_float("PAPER_STARTING_CASH", 100.0),
     )
 
     logging = LoggingConfig(
@@ -121,8 +151,35 @@ def load_config(dotenv_path: str = ".env") -> AppConfig:
         json_logs=_get_bool("JSON_LOGS", False),
     )
 
+    position_sizing = PositionSizingConfig(
+        mode=_get_env("POSITION_SIZING_MODE", "fixed_percent").lower(),
+        starting_balance=_get_float("STARTING_BALANCE", trading.paper_starting_cash),
+        min_order_size=_get_float("MIN_ORDER_SIZE", 1.0),
+        max_order_size=_get_float("MAX_ORDER_SIZE", 1000.0),
+        max_exposure_pct=_get_float("MAX_EXPOSURE_PCT", 15.0),
+
+        fixed_percent=_get_float("FIXED_PERCENT", 2.0),
+        fixed_amount=_get_float("FIXED_AMOUNT", 10.0),
+
+        kelly_win_rate=_get_float("KELLY_WIN_RATE", 0.55),
+        kelly_reward_ratio=_get_float("KELLY_REWARD_RATIO", 1.0),
+
+        martingale_base_amount=_get_float("MARTINGALE_BASE_AMOUNT", 2.0),
+        martingale_multiplier=_get_float("MARTINGALE_MULTIPLIER", 2.0),
+        martingale_max_steps=_get_int("MARTINGALE_MAX_STEPS", 5),
+
+        anti_martingale_base_amount=_get_float("ANTI_MARTINGALE_BASE_AMOUNT", 2.0),
+        anti_martingale_multiplier=_get_float("ANTI_MARTINGALE_MULTIPLIER", 1.5),
+        anti_martingale_max_steps=_get_int("ANTI_MARTINGALE_MAX_STEPS", 4),
+
+        signal_conf_low_pct=_get_float("SIGNAL_CONF_LOW_PCT", 1.0),
+        signal_conf_medium_pct=_get_float("SIGNAL_CONF_MEDIUM_PCT", 2.0),
+        signal_conf_high_pct=_get_float("SIGNAL_CONF_HIGH_PCT", 4.0),
+    )
+
     return AppConfig(
         polymarket=polymarket,
         trading=trading,
         logging=logging,
+        position_sizing=position_sizing,
     )

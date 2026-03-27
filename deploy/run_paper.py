@@ -14,7 +14,7 @@ from bot.execution import ExecutionEngine
 from bot.paper_portfolio import PaperPortfolio
 from bot.polymarket_client import PolymarketClient
 from bot.trader import Trader
-from estrategias.risk_manager import (
+from strategies.position_sizing import (
     PositionSizingConfig as RiskManagerConfig,
     PositionSizingMode,
     PositionSizingState,
@@ -79,7 +79,7 @@ def get_strategies():
     }
 
 
-def build_risk_manager_config(config: AppConfig) -> RiskManagerConfig:
+def build_position_sizer_config(config: AppConfig) -> SizingConfig:
     mode_raw = (config.position_sizing.mode or "fixed_percent").strip().lower()
 
     try:
@@ -87,7 +87,7 @@ def build_risk_manager_config(config: AppConfig) -> RiskManagerConfig:
     except ValueError:
         mode = PositionSizingMode.FIXED_PERCENT
 
-    return RiskManagerConfig(
+    return SizingConfig(
         mode=mode,
         starting_balance=config.position_sizing.starting_balance,
         min_order_size=config.position_sizing.min_order_size,

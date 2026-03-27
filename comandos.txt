@@ -2,7 +2,28 @@
 ssh -i C:\Users\nessa\.ssh\polymarket_bot root@65.108.244.109
 
 # copiar do pc para o servidor
-scp -i C:\Users\nessa\.ssh\polymarket_bot -r C:\Users\nessa\polymarket-rbi-bot\* root@65.108.244.109:/root/bots/polymarket-rbi-bot/
+scp -i C:\Users\nessa\.ssh\polymarket_bot -r C:\Users\nessa\polymarketbot\* root@65.108.244.109:/root/bots/polymarket-rbi-bot/
 
 #editar no servidor
 nano .env
+
+#Correr bot
+cd ~/polymarketbot && source .venv/bin/activate && python deploy/run_paper.py
+
+#Limpar logs antigos
+cd ~/polymarketbot
+rm -f logs/cycles.csv logs/portfolio.csv logs/trades.csv logs/portfolio_state.json
+
+#ver logs
+tail -n 5 logs/cycles.csv
+tail -n 5 logs/portfolio.csv
+tail -n 5 logs/trades.csv
+
+#fazer commit
+git status
+git add 
+git commit -m "problemas com nome de ficheiros resolvidos. Graças à merda do chatgpt"
+git push origin main
+
+#Endereço do dashboard
+http://65.108.244.109:8501/
