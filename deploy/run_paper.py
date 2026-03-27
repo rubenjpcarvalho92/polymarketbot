@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import time
-import requests
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+import requests
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -16,28 +17,69 @@ from bot.execution import ExecutionEngine
 from bot.paper_portfolio import PaperPortfolio
 from bot.polymarket_client import PolymarketClient
 from bot.trader import Trader
+from strategies.base_strategy import StrategyContext
+from strategies.macd_classic import MacdClassicStrategy
+from strategies.macd_refined import MacdRefinedStrategy
 from strategies.position_sizing import (
     PositionSizingConfig,
     PositionSizingMode,
     PositionSizingState,
     PositionSizer,
 )
-from strategies.base_strategy import StrategyContext
-from strategies.macd_classic import MacdClassicStrategy
-from strategies.macd_refined import MacdRefinedStrategy
 from strategies.rsi_vwap import RsiVwapStrategy
 
 
-def get_strategies():
+def get_strategies() -> dict:
     return {
         "macd_classic": MacdClassicStrategy(),
         "macd_refined": MacdRefinedStrategy(),
         "rsi_vwap": RsiVwapStrategy(),
     }
 
+
 def get_public_clob_host(config: AppConfig) -> str:
     raw_host = getattr(config.polymarket, "host", None) or "https://clob.polymarket.com"
     return str(raw_host).rstrip("/")
+
+
+def build_fake_history_from_orderbook(best_bid: float, best_ask: float) -> dict:
+    midpoint = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0.5
+
+    closes: list[float] = []
+    highs: list[float] = []
+    lows: list[float] = []
+    volumes: list[float] = []
+
+    base = midpoint - 0.03
+
+    for i in range(220):
+        value = base + (i * 0.00025)
+
+        if i % 13 in (0, 1, 2):
+            value -= 0.002
+        elif i % 13 in (7, 8):
+            value += 0.0015
+
+        value = max(0.05, min(0.95, value))
+
+        high = min(value + 0.01, 0.99)
+        low = max(value - 0.01, 0.01)
+
+        closes.append(value)
+        highs.append(high)
+        lows.append(low)
+        volumes.append(10.0 + (i % 5))
+
+    closes[-1] = midpoint
+    highs[-1] = min(midpoint + 0.01, 0.99)
+    lows[-1] = max(midpoint - 0.01, 0.01)
+
+    return {
+        "closes": closes,
+        "highs": highs,
+        "lows": lows,
+        "volumes": volumes,
+    }
 
 
 def fetch_prices_history(
@@ -75,7 +117,10 @@ def fetch_prices_history(
                 params=params,
                 timeout=20,
             )
-            response.raise_for_status()
+
+            if response.status_code != 200:
+                last_error = f"HTTP {response.status_code} for params={params}"
+                continue
 
             payload = response.json()
             history = payload.get("history", [])
@@ -84,6 +129,7 @@ def fetch_prices_history(
             for item in history:
                 if "p" not in item:
                     continue
+
                 try:
                     cleaned.append(
                         {
@@ -106,30 +152,49 @@ def fetch_prices_history(
 
 def fetch_spread(config: AppConfig, token_id: str) -> float:
     host = get_public_clob_host(config)
-    response = requests.get(
-        f"{host}/spread",
-        params={"token_id": token_id},
-        timeout=20,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    return float(payload.get("spread", 0.0) or 0.0)
+
+    try:
+        response = requests.get(
+            f"{host}/spread",
+            params={"token_id": token_id},
+            timeout=20,
+        )
+
+        if response.status_code != 200:
+            print(f"WARNING: spread HTTP {response.status_code} for token {token_id}")
+            return 0.0
+
+        payload = response.json()
+        return float(payload.get("spread", 0.0) or 0.0)
+
+    except Exception as exc:
+        print(f"WARNING: spread fetch failed for token {token_id}: {exc}")
+        return 0.0
 
 
 def fetch_last_trade_price(config: AppConfig, token_id: str) -> dict:
     host = get_public_clob_host(config)
-    response = requests.get(
-        f"{host}/last-trade-price",
-        params={"token_id": token_id},
-        timeout=20,
-    )
-    response.raise_for_status()
-    payload = response.json()
 
-    return {
-        "price": float(payload.get("price", 0.0) or 0.0),
-        "side": str(payload.get("side", "") or ""),
-    }
+    try:
+        response = requests.get(
+            f"{host}/last-trade-price",
+            params={"token_id": token_id},
+            timeout=20,
+        )
+
+        if response.status_code != 200:
+            print(f"WARNING: last-trade-price HTTP {response.status_code} for token {token_id}")
+            return {"price": 0.0, "side": ""}
+
+        payload = response.json()
+        return {
+            "price": float(payload.get("price", 0.0) or 0.0),
+            "side": str(payload.get("side", "") or ""),
+        }
+
+    except Exception as exc:
+        print(f"WARNING: last-trade-price fetch failed for token {token_id}: {exc}")
+        return {"price": 0.0, "side": ""}
 
 
 def build_real_history_from_prices_history(
@@ -179,6 +244,8 @@ def build_real_history_from_prices_history(
         "lows": lows,
         "volumes": volumes,
     }
+
+
 def build_position_sizer_config(config: AppConfig) -> PositionSizingConfig:
     mode_raw = (config.position_sizing.mode or "fixed_percent").strip().lower()
 
@@ -207,50 +274,9 @@ def build_position_sizer_config(config: AppConfig) -> PositionSizingConfig:
         signal_conf_medium_pct=config.position_sizing.signal_conf_medium_pct,
         signal_conf_high_pct=config.position_sizing.signal_conf_high_pct,
     )
-    def build_fake_history_from_orderbook(best_bid: float, best_ask: float) -> dict:
-    midpoint = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0.5
-
-    closes: list[float] = []
-    highs: list[float] = []
-    lows: list[float] = []
-    volumes: list[float] = []
-
-    base = midpoint - 0.03
-
-    for i in range(220):
-        value = base + (i * 0.00025)
-
-        if i % 13 in (0, 1, 2):
-            value -= 0.002
-        elif i % 13 in (7, 8):
-            value += 0.0015
-
-        value = max(0.05, min(0.95, value))
-
-        high = min(value + 0.01, 0.99)
-        low = max(value - 0.01, 0.01)
-
-        closes.append(value)
-        highs.append(high)
-        lows.append(low)
-        volumes.append(10.0 + (i % 5))
-
-    closes[-1] = midpoint
-    highs[-1] = min(midpoint + 0.01, 0.99)
-    lows[-1] = max(midpoint - 0.01, 0.01)
-
-    return {
-        "closes": closes,
-        "highs": highs,
-        "lows": lows,
-        "volumes": volumes,
-    }
 
 
 def build_position_sizing_state(portfolio_snapshot: dict) -> PositionSizingState:
-    """
-    Build state for the risk manager from the current paper portfolio snapshot.
-    """
     equity_total = float(portfolio_snapshot.get("equity_total", 0.0) or 0.0)
     market_value = float(portfolio_snapshot.get("market_value", 0.0) or 0.0)
 
@@ -263,12 +289,6 @@ def build_position_sizing_state(portfolio_snapshot: dict) -> PositionSizingState
 
 
 def get_signal_strength(result) -> str:
-    """
-    Placeholder signal strength mapper.
-    For now:
-    - if metadata contains signal_strength, use it
-    - otherwise default to medium
-    """
     if not result:
         return "medium"
 
@@ -283,18 +303,21 @@ def get_signal_strength(result) -> str:
 
 def main() -> None:
     config = load_config()
-    spread = fetch_spread(config, config.trading.default_token_id)
-    last_trade = fetch_last_trade_price(config, config.trading.default_token_id)
-
-    print(f"spread   : {spread}")
-    print(f"last_px  : {last_trade['price']}")
-    print(f"last_side: {last_trade['side']}")
-    print()
 
     if not config.trading.default_token_id:
         print("DEFAULT_TOKEN_ID is empty in .env")
         print("Set a real token id first.")
         return
+
+    token_id = config.trading.default_token_id
+
+    spread = fetch_spread(config, token_id)
+    last_trade = fetch_last_trade_price(config, token_id)
+
+    print(f"spread   : {spread}")
+    print(f"last_px  : {last_trade['price']}")
+    print(f"last_side: {last_trade['side']}")
+    print()
 
     starting_cash = config.trading.paper_starting_cash
 
@@ -312,7 +335,7 @@ def main() -> None:
     print(f"Mode                 : {config.trading.trading_mode}")
     print(f"Dry run              : {config.trading.dry_run}")
     print(f"Strategy             : {config.trading.strategy_name}")
-    print(f"Token ID             : {config.trading.default_token_id}")
+    print(f"Token ID             : {token_id}")
     print(f"Default order size   : {config.trading.default_order_size}")
     print(f"Position sizing mode : {risk_config.mode.value}")
     print(f"Starting cash        : {starting_cash}")
@@ -321,7 +344,7 @@ def main() -> None:
     print()
 
     client = PolymarketClient(config.polymarket)
-    book = client.get_order_book(config.trading.default_token_id)
+    book = client.get_order_book(token_id)
 
     print("Live order book snapshot")
     print("------------------------")
@@ -348,13 +371,13 @@ def main() -> None:
 
     market_data = build_real_history_from_prices_history(
         config=config,
-        token_id=config.trading.default_token_id,
+        token_id=token_id,
         best_bid=book.best_bid,
         best_ask=book.best_ask,
     )
 
     context = StrategyContext(
-        market_id=config.trading.default_token_id,
+        market_id=token_id,
         timestamp="live-paper-snapshot",
         data=market_data,
     )
@@ -383,7 +406,7 @@ def main() -> None:
         best_bid=book.best_bid,
         best_ask=book.best_ask,
         order_size=calculated_order_size,
-        token_id=config.trading.default_token_id,
+        token_id=token_id,
     )
 
     print("Trader decision")
@@ -409,13 +432,13 @@ def main() -> None:
 
     metadata = result.metadata if result else {}
     order_status = metadata.get("order_status", "")
-    position_side = metadata.get("side", "")
+    position_side = metadata.get("position_side", metadata.get("side", ""))
     limit_price = float(metadata.get("limit_price", 0.0) or 0.0)
-    order_size = float(calculated_order_size or 0.0)
+    order_size = float(metadata.get("closed_size", calculated_order_size) or 0.0)
 
     if order_status == "FILLED" and position_side and limit_price > 0 and order_size > 0:
         portfolio.apply_fill(
-            token_id=config.trading.default_token_id,
+            token_id=token_id,
             side=position_side,
             size=order_size,
             price=limit_price,
@@ -423,7 +446,7 @@ def main() -> None:
 
     if position_side and midpoint > 0:
         portfolio.mark_position(
-            token_id=config.trading.default_token_id,
+            token_id=token_id,
             side=position_side,
             mark_price=midpoint,
         )
@@ -470,7 +493,7 @@ def main() -> None:
             "last_trade_price": last_trade["price"],
             "last_trade_side": last_trade["side"],
             "timestamp": timestamp_utc,
-            "token_id": config.trading.default_token_id,
+            "token_id": token_id,
             "strategy": config.trading.strategy_name,
             "position_sizing_mode": risk_config.mode.value,
             "signal_strength": signal_strength,
@@ -512,7 +535,7 @@ def main() -> None:
             trade_fields,
             {
                 "timestamp": timestamp_utc,
-                "token_id": config.trading.default_token_id,
+                "token_id": token_id,
                 "side": position_side,
                 "price": limit_price,
                 "size": order_size,
