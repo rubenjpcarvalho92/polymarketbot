@@ -20,10 +20,23 @@ tail -n 5 logs/portfolio.csv
 tail -n 5 logs/trades.csv
 
 #fazer commit
-git status
-git add 
-git commit -m "problemas com nome de ficheiros resolvidos. Graças à merda do chatgpt"
+echo .env >> .gitignore
+git rm --cached .env
+git add .
+git commit -m "mx exposure maximizado"
 git push origin main
 
 #Endereço do dashboard
 http://65.108.244.109:8501/
+
+#fazer pull
+cd /root/polymarketbot
+git checkout -- .env
+git pull origin main
+sudo systemctl restart polymarketbot
+tail -f logs/bot.log
+
+#arrancar dashboard
+cd /root/polymarketbot
+source .venv/bin/activate
+streamlit run NOME_DO_FICHEIRO.py --server.address 0.0.0.0 --server.port 8501

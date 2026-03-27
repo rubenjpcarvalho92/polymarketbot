@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -16,6 +15,11 @@ from bot.csv_logger import append_csv_row
 from bot.execution import ExecutionEngine
 from bot.paper_portfolio import PaperPortfolio
 from bot.polymarket_client import PolymarketClient
+from bot.price_history import (
+    append_raw_market_snapshot,
+    bootstrap_history_file_from_api,
+    build_market_data_from_local_history,
+)
 from bot.trader import Trader
 from strategies.base_strategy import StrategyContext
 from strategies.macd_classic import MacdClassicStrategy
@@ -27,6 +31,9 @@ from strategies.position_sizing import (
     PositionSizer,
 )
 from strategies.rsi_vwap import RsiVwapStrategy
+
+
+LOGS_DIR = PROJECT_ROOT / "logs"
 
 
 def get_strategies() -> dict:
@@ -82,74 +89,6 @@ def build_fake_history_from_orderbook(best_bid: float, best_ask: float) -> dict:
     }
 
 
-def fetch_prices_history(
-    config: AppConfig,
-    token_id: str,
-    lookback_hours: int = 12,
-    interval: str = "1h",
-    fidelity: int = 60,
-) -> list[dict]:
-    host = get_public_clob_host(config)
-    end_ts = int(time.time())
-    start_ts = end_ts - (lookback_hours * 3600)
-
-    attempts = [
-        {
-            "market": token_id,
-            "startTs": start_ts,
-            "endTs": end_ts,
-            "interval": interval,
-            "fidelity": fidelity,
-        },
-        {
-            "market": token_id,
-            "interval": "max",
-            "fidelity": 60,
-        },
-    ]
-
-    last_error = None
-
-    for params in attempts:
-        try:
-            response = requests.get(
-                f"{host}/prices-history",
-                params=params,
-                timeout=20,
-            )
-
-            if response.status_code != 200:
-                last_error = f"HTTP {response.status_code} for params={params}"
-                continue
-
-            payload = response.json()
-            history = payload.get("history", [])
-
-            cleaned: list[dict] = []
-            for item in history:
-                if "p" not in item:
-                    continue
-
-                try:
-                    cleaned.append(
-                        {
-                            "t": int(item.get("t", 0)),
-                            "p": float(item["p"]),
-                        }
-                    )
-                except (TypeError, ValueError):
-                    continue
-
-            if cleaned:
-                return cleaned
-
-        except Exception as exc:
-            last_error = exc
-
-    print(f"WARNING: prices-history failed for token {token_id}: {last_error}")
-    return []
-
-
 def fetch_spread(config: AppConfig, token_id: str) -> float:
     host = get_public_clob_host(config)
 
@@ -195,55 +134,6 @@ def fetch_last_trade_price(config: AppConfig, token_id: str) -> dict:
     except Exception as exc:
         print(f"WARNING: last-trade-price fetch failed for token {token_id}: {exc}")
         return {"price": 0.0, "side": ""}
-
-
-def build_real_history_from_prices_history(
-    config: AppConfig,
-    token_id: str,
-    best_bid: float,
-    best_ask: float,
-) -> dict:
-    points = fetch_prices_history(
-        config=config,
-        token_id=token_id,
-        lookback_hours=12,
-        interval="1h",
-        fidelity=60,
-    )
-
-    if len(points) < 35:
-        print(
-            f"WARNING: insufficient prices-history points ({len(points)}). "
-            "Falling back to synthetic history for this cycle."
-        )
-        return build_fake_history_from_orderbook(best_bid, best_ask)
-
-    closes = [float(point["p"]) for point in points]
-
-    highs: list[float] = []
-    lows: list[float] = []
-    volumes: list[float] = []
-
-    rolling_window = 5
-    for i, close in enumerate(closes):
-        start = max(0, i - rolling_window + 1)
-        window_prices = closes[start : i + 1]
-        highs.append(max(window_prices))
-        lows.append(min(window_prices))
-        volumes.append(1.0)
-
-    midpoint = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0.0
-    if midpoint > 0:
-        closes[-1] = midpoint
-        highs[-1] = max(highs[-1], midpoint)
-        lows[-1] = min(lows[-1], midpoint)
-
-    return {
-        "closes": closes,
-        "highs": highs,
-        "lows": lows,
-        "volumes": volumes,
-    }
 
 
 def build_position_sizer_config(config: AppConfig) -> PositionSizingConfig:
@@ -310,6 +200,7 @@ def main() -> None:
         return
 
     token_id = config.trading.default_token_id
+    clob_host = get_public_clob_host(config)
 
     spread = fetch_spread(config, token_id)
     last_trade = fetch_last_trade_price(config, token_id)
@@ -354,6 +245,45 @@ def main() -> None:
     print(f"ask_size : {book.ask_size}")
     print()
 
+    history_path = bootstrap_history_file_from_api(
+        logs_dir=LOGS_DIR,
+        clob_host=clob_host,
+        token_id=token_id,
+        lookback_hours=24,
+    )
+
+    timestamp_utc = datetime.now(timezone.utc).isoformat()
+
+    append_raw_market_snapshot(
+        history_path=history_path,
+        timestamp_utc=timestamp_utc,
+        best_bid=book.best_bid,
+        best_ask=book.best_ask,
+        bid_size=book.bid_size,
+        ask_size=book.ask_size,
+        spread=spread,
+        last_trade_price=last_trade["price"],
+        last_trade_side=last_trade["side"],
+        keep_last_hours=24,
+    )
+
+    market_data = build_market_data_from_local_history(
+        history_path=history_path,
+        keep_last_hours=24,
+        min_points=35,
+    )
+
+    if market_data is None:
+        print("WARNING: insufficient local history. Falling back to synthetic history for this cycle.")
+        market_data = build_fake_history_from_orderbook(book.best_bid, book.best_ask)
+    else:
+        print(
+            f"History source      : local_raw+api_bootstrap\n"
+            f"History file        : {history_path.name}\n"
+            f"History window      : 24h"
+        )
+        print()
+
     strategies = get_strategies()
     if config.trading.strategy_name not in strategies:
         print(f"Unknown strategy in .env: {config.trading.strategy_name}")
@@ -367,13 +297,6 @@ def main() -> None:
     trader = Trader(
         strategies=strategies,
         execution_engine=execution_engine,
-    )
-
-    market_data = build_real_history_from_prices_history(
-        config=config,
-        token_id=token_id,
-        best_bid=book.best_bid,
-        best_ask=book.best_ask,
     )
 
     context = StrategyContext(
@@ -427,7 +350,6 @@ def main() -> None:
             print(market_id, position)
 
     midpoint = (book.best_bid + book.best_ask) / 2 if book.best_bid > 0 and book.best_ask > 0 else 0.0
-    timestamp_utc = datetime.now(timezone.utc).isoformat()
 
     signal_strength = get_signal_strength(result)
 
