@@ -1,54 +1,146 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
+
+
+class PositionSizingMode(str, Enum):
+    FIXED_PERCENT = "fixed_percent"
+    FIXED_AMOUNT = "fixed_amount"
+    KELLY = "kelly"
+    HALF_KELLY = "half_kelly"
+    QUARTER_KELLY = "quarter_kelly"
+    MARTINGALE = "martingale"
+    ANTI_MARTINGALE = "anti_martingale"
+    SIGNAL_CONFIDENCE = "signal_confidence"
 
 
 @dataclass(slots=True)
-class RiskLimits:
-    max_position_per_market: float = 100.0
-    max_total_exposure: float = 500.0
-    max_open_orders: int = 10
-    max_daily_loss: float = 100.0
-    max_consecutive_losses: int = 3
+class PositionSizingConfig:
+    mode: PositionSizingMode = PositionSizingMode.FIXED_PERCENT
+    starting_balance: float = 100.0
+    min_order_size: float = 1.0
+    max_order_size: float = 1000.0
+    max_exposure_pct: float = 15.0
+
+    fixed_percent: float = 2.0
+    fixed_amount: float = 10.0
+
+    kelly_win_rate: float = 0.55
+    kelly_reward_ratio: float = 1.0
+
+    martingale_base_amount: float = 2.0
+    martingale_multiplier: float = 2.0
+    martingale_max_steps: int = 5
+
+    anti_martingale_base_amount: float = 2.0
+    anti_martingale_multiplier: float = 1.5
+    anti_martingale_max_steps: int = 4
+
+    signal_conf_low_pct: float = 1.0
+    signal_conf_medium_pct: float = 2.0
+    signal_conf_high_pct: float = 4.0
 
 
-class RiskManager:
-    def __init__(self, limits: RiskLimits | None = None) -> None:
-        self.limits = limits or RiskLimits()
-        self.daily_realized_pnl: float = 0.0
-        self.consecutive_losses: int = 0
+@dataclass(slots=True)
+class PositionSizingState:
+    current_balance: float
+    open_exposure: float = 0.0
+    consecutive_losses: int = 0
+    consecutive_wins: int = 0
 
-    def can_place_order(
+
+class PositionSizer:
+    def __init__(self, config: PositionSizingConfig):
+        self.config = config
+
+    def calculate_order_size(
         self,
-        market_exposure: float,
-        total_exposure: float,
-        open_orders_count: int,
-        order_size: float,
-    ) -> tuple[bool, str]:
-        if order_size <= 0:
-            return False, "invalid_order_size"
+        state: PositionSizingState,
+        signal_strength: str = "medium",
+        estimated_win_rate: float | None = None,
+        estimated_reward_ratio: float | None = None,
+    ) -> float:
+        available_exposure = self._available_exposure(state)
+        if available_exposure <= 0:
+            return 0.0
 
-        if open_orders_count >= self.limits.max_open_orders:
-            return False, "max_open_orders_reached"
+        mode = self.config.mode
 
-        if market_exposure + order_size > self.limits.max_position_per_market:
-            return False, "max_position_per_market_exceeded"
+        if mode == PositionSizingMode.FIXED_PERCENT:
+            size = state.current_balance * (self.config.fixed_percent / 100.0)
 
-        if total_exposure + order_size > self.limits.max_total_exposure:
-            return False, "max_total_exposure_exceeded"
+        elif mode == PositionSizingMode.FIXED_AMOUNT:
+            size = self.config.fixed_amount
 
-        if abs(self.daily_realized_pnl) >= self.limits.max_daily_loss and self.daily_realized_pnl < 0:
-            return False, "max_daily_loss_reached"
+        elif mode == PositionSizingMode.KELLY:
+            size = state.current_balance * self._kelly_fraction(
+                estimated_win_rate or self.config.kelly_win_rate,
+                estimated_reward_ratio or self.config.kelly_reward_ratio,
+                1.0,
+            )
 
-        if self.consecutive_losses >= self.limits.max_consecutive_losses:
-            return False, "max_consecutive_losses_reached"
+        elif mode == PositionSizingMode.HALF_KELLY:
+            size = state.current_balance * self._kelly_fraction(
+                estimated_win_rate or self.config.kelly_win_rate,
+                estimated_reward_ratio or self.config.kelly_reward_ratio,
+                0.5,
+            )
 
-        return True, "ok"
+        elif mode == PositionSizingMode.QUARTER_KELLY:
+            size = state.current_balance * self._kelly_fraction(
+                estimated_win_rate or self.config.kelly_win_rate,
+                estimated_reward_ratio or self.config.kelly_reward_ratio,
+                0.25,
+            )
 
-    def register_closed_trade(self, pnl: float) -> None:
-        self.daily_realized_pnl += pnl
+        elif mode == PositionSizingMode.MARTINGALE:
+            step = min(state.consecutive_losses, self.config.martingale_max_steps)
+            size = self.config.martingale_base_amount * (
+                self.config.martingale_multiplier ** step
+            )
 
-        if pnl < 0:
-            self.consecutive_losses += 1
-        elif pnl > 0:
-            self.consecutive_losses = 0
+        elif mode == PositionSizingMode.ANTI_MARTINGALE:
+            step = min(state.consecutive_wins, self.config.anti_martingale_max_steps)
+            size = self.config.anti_martingale_base_amount * (
+                self.config.anti_martingale_multiplier ** step
+            )
+
+        elif mode == PositionSizingMode.SIGNAL_CONFIDENCE:
+            strength = signal_strength.strip().lower()
+            if strength == "low":
+                pct = self.config.signal_conf_low_pct
+            elif strength == "high":
+                pct = self.config.signal_conf_high_pct
+            else:
+                pct = self.config.signal_conf_medium_pct
+            size = state.current_balance * (pct / 100.0)
+
+        else:
+            size = state.current_balance * (self.config.fixed_percent / 100.0)
+
+        size = max(self.config.min_order_size, min(size, self.config.max_order_size))
+        size = min(size, available_exposure, state.current_balance)
+
+        return round(max(size, 0.0), 2)
+
+    def _available_exposure(self, state: PositionSizingState) -> float:
+        max_exposure_value = state.current_balance * (self.config.max_exposure_pct / 100.0)
+        remaining = max_exposure_value - state.open_exposure
+        return max(0.0, remaining)
+
+    @staticmethod
+    def _kelly_fraction(
+        win_rate: float,
+        reward_ratio: float,
+        fraction_multiplier: float,
+    ) -> float:
+        p = max(0.0, min(win_rate, 1.0))
+        q = 1.0 - p
+        b = max(reward_ratio, 1e-9)
+
+        raw_fraction = ((p * b) - q) / b
+        raw_fraction = max(0.0, raw_fraction)
+
+        final_fraction = raw_fraction * fraction_multiplier
+        return min(final_fraction, 1.0)
