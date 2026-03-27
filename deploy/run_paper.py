@@ -44,44 +44,64 @@ def fetch_prices_history(
     config: AppConfig,
     token_id: str,
     lookback_hours: int = 12,
-    interval: str = "1m",
-    fidelity: int = 1,
+    interval: str = "1h",
+    fidelity: int = 60,
 ) -> list[dict]:
     host = get_public_clob_host(config)
     end_ts = int(time.time())
     start_ts = end_ts - (lookback_hours * 3600)
 
-    response = requests.get(
-        f"{host}/prices-history",
-        params={
+    attempts = [
+        {
             "market": token_id,
             "startTs": start_ts,
             "endTs": end_ts,
             "interval": interval,
             "fidelity": fidelity,
         },
-        timeout=20,
-    )
-    response.raise_for_status()
+        {
+            "market": token_id,
+            "interval": "max",
+            "fidelity": 60,
+        },
+    ]
 
-    payload = response.json()
-    history = payload.get("history", [])
+    last_error = None
 
-    cleaned: list[dict] = []
-    for item in history:
-        if "p" not in item:
-            continue
+    for params in attempts:
         try:
-            cleaned.append(
-                {
-                    "t": int(item.get("t", 0)),
-                    "p": float(item["p"]),
-                }
+            response = requests.get(
+                f"{host}/prices-history",
+                params=params,
+                timeout=20,
             )
-        except (TypeError, ValueError):
-            continue
+            response.raise_for_status()
 
-    return cleaned
+            payload = response.json()
+            history = payload.get("history", [])
+
+            cleaned: list[dict] = []
+            for item in history:
+                if "p" not in item:
+                    continue
+                try:
+                    cleaned.append(
+                        {
+                            "t": int(item.get("t", 0)),
+                            "p": float(item["p"]),
+                        }
+                    )
+                except (TypeError, ValueError):
+                    continue
+
+            if cleaned:
+                return cleaned
+
+        except Exception as exc:
+            last_error = exc
+
+    print(f"WARNING: prices-history failed for token {token_id}: {last_error}")
+    return []
 
 
 def fetch_spread(config: AppConfig, token_id: str) -> float:
@@ -122,19 +142,19 @@ def build_real_history_from_prices_history(
         config=config,
         token_id=token_id,
         lookback_hours=12,
-        interval="1m",
-        fidelity=1,
+        interval="1h",
+        fidelity=60,
     )
 
     if len(points) < 35:
-        raise RuntimeError(
-            f"Not enough real price history for indicators. Got {len(points)} points, need at least 35."
+        print(
+            f"WARNING: insufficient prices-history points ({len(points)}). "
+            "Falling back to synthetic history for this cycle."
         )
+        return build_fake_history_from_orderbook(best_bid, best_ask)
 
     closes = [float(point["p"]) for point in points]
 
-    # Fazemos highs/lows a partir de uma janela curta da própria série real.
-    # Para MACD/RSI o importante são sobretudo os closes.
     highs: list[float] = []
     lows: list[float] = []
     volumes: list[float] = []
@@ -187,6 +207,44 @@ def build_position_sizer_config(config: AppConfig) -> PositionSizingConfig:
         signal_conf_medium_pct=config.position_sizing.signal_conf_medium_pct,
         signal_conf_high_pct=config.position_sizing.signal_conf_high_pct,
     )
+    def build_fake_history_from_orderbook(best_bid: float, best_ask: float) -> dict:
+    midpoint = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0.5
+
+    closes: list[float] = []
+    highs: list[float] = []
+    lows: list[float] = []
+    volumes: list[float] = []
+
+    base = midpoint - 0.03
+
+    for i in range(220):
+        value = base + (i * 0.00025)
+
+        if i % 13 in (0, 1, 2):
+            value -= 0.002
+        elif i % 13 in (7, 8):
+            value += 0.0015
+
+        value = max(0.05, min(0.95, value))
+
+        high = min(value + 0.01, 0.99)
+        low = max(value - 0.01, 0.01)
+
+        closes.append(value)
+        highs.append(high)
+        lows.append(low)
+        volumes.append(10.0 + (i % 5))
+
+    closes[-1] = midpoint
+    highs[-1] = min(midpoint + 0.01, 0.99)
+    lows[-1] = max(midpoint - 0.01, 0.01)
+
+    return {
+        "closes": closes,
+        "highs": highs,
+        "lows": lows,
+        "volumes": volumes,
+    }
 
 
 def build_position_sizing_state(portfolio_snapshot: dict) -> PositionSizingState:
