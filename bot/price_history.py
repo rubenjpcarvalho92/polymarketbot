@@ -9,27 +9,28 @@ import pandas as pd
 import requests
 
 
+RAW_FIELDS = [
+    "timestamp",
+    "source",
+    "midpoint",
+    "best_bid",
+    "best_ask",
+    "bid_size",
+    "ask_size",
+    "spread",
+    "last_trade_price",
+    "last_trade_side",
+    "volume_proxy",
+]
+
+
 def get_history_file_path(logs_dir: Path, token_id: str) -> Path:
     safe_token = str(token_id).strip()
     return logs_dir / f"price_history_{safe_token}.csv"
 
 
 def _empty_history_df() -> pd.DataFrame:
-    return pd.DataFrame(
-        columns=[
-            "timestamp",
-            "source",
-            "midpoint",
-            "best_bid",
-            "best_ask",
-            "bid_size",
-            "ask_size",
-            "spread",
-            "last_trade_price",
-            "last_trade_side",
-            "volume_proxy",
-        ]
-    )
+    return pd.DataFrame(columns=RAW_FIELDS)
 
 
 def _fetch_api_history_points(
@@ -161,7 +162,7 @@ def bootstrap_history_file_from_api(
             }
         )
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=RAW_FIELDS)
     df.to_csv(history_path, index=False)
     return history_path
 
@@ -186,22 +187,7 @@ def append_raw_market_snapshot(
     file_exists = history_path.exists() and history_path.stat().st_size > 0
 
     with history_path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "timestamp",
-                "source",
-                "midpoint",
-                "best_bid",
-                "best_ask",
-                "bid_size",
-                "ask_size",
-                "spread",
-                "last_trade_price",
-                "last_trade_side",
-                "volume_proxy",
-            ],
-        )
+        writer = csv.DictWriter(f, fieldnames=RAW_FIELDS)
 
         if not file_exists:
             writer.writeheader()
@@ -246,17 +232,18 @@ def prune_history_file(history_path: Path, keep_last_hours: int = 24) -> None:
     if df.empty:
         df = _empty_history_df()
 
-    if "timestamp" in df.columns and not df.empty:
+    if not df.empty and "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+        df = df.dropna(subset=["timestamp"])
         df["timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%S%z")
 
     df.to_csv(history_path, index=False)
 
 
-def build_market_data_from_local_history(
+def _load_history_df(
     history_path: Path,
     keep_last_hours: int = 24,
-    min_points: int = 35,
-) -> dict | None:
+) -> pd.DataFrame | None:
     if not history_path.exists() or history_path.stat().st_size == 0:
         return None
 
@@ -279,7 +266,19 @@ def build_market_data_from_local_history(
     cutoff = datetime.now(timezone.utc) - timedelta(hours=keep_last_hours)
     df = df[df["timestamp"] >= cutoff]
 
-    if len(df) < min_points:
+    if df.empty:
+        return None
+
+    return df
+
+
+def build_market_data_from_local_history(
+    history_path: Path,
+    keep_last_hours: int = 24,
+    min_points: int = 35,
+) -> dict | None:
+    df = _load_history_df(history_path=history_path, keep_last_hours=keep_last_hours)
+    if df is None or len(df) < min_points:
         return None
 
     closes = df["midpoint"].astype(float).tolist()
@@ -289,7 +288,7 @@ def build_market_data_from_local_history(
     volumes: list[float] = []
 
     rolling_window = 5
-    for i, close in enumerate(closes):
+    for i, _close in enumerate(closes):
         start = max(0, i - rolling_window + 1)
         window_prices = closes[start : i + 1]
         highs.append(max(window_prices))
@@ -301,4 +300,55 @@ def build_market_data_from_local_history(
         "highs": highs,
         "lows": lows,
         "volumes": volumes,
+    }
+
+
+def build_candles_from_local_history(
+    history_path: Path,
+    keep_last_hours: int = 24,
+    candle_minutes: int = 1,
+) -> pd.DataFrame:
+    df = _load_history_df(history_path=history_path, keep_last_hours=keep_last_hours)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume_proxy"])
+
+    rule = f"{int(candle_minutes)}min"
+
+    candles = (
+        df.set_index("timestamp")
+        .resample(rule)
+        .agg(
+            open=("midpoint", "first"),
+            high=("midpoint", "max"),
+            low=("midpoint", "min"),
+            close=("midpoint", "last"),
+            volume_proxy=("volume_proxy", "sum"),
+        )
+        .dropna(subset=["open", "high", "low", "close"])
+        .reset_index()
+    )
+
+    return candles
+
+
+def build_market_data_from_candles(
+    history_path: Path,
+    keep_last_hours: int = 24,
+    candle_minutes: int = 1,
+    min_candles: int = 35,
+) -> dict | None:
+    candles = build_candles_from_local_history(
+        history_path=history_path,
+        keep_last_hours=keep_last_hours,
+        candle_minutes=candle_minutes,
+    )
+
+    if candles.empty or len(candles) < min_candles:
+        return None
+
+    return {
+        "closes": candles["close"].astype(float).tolist(),
+        "highs": candles["high"].astype(float).tolist(),
+        "lows": candles["low"].astype(float).tolist(),
+        "volumes": candles["volume_proxy"].astype(float).tolist(),
     }

@@ -18,7 +18,7 @@ from bot.polymarket_client import PolymarketClient
 from bot.price_history import (
     append_raw_market_snapshot,
     bootstrap_history_file_from_api,
-    build_market_data_from_local_history,
+    build_market_data_from_candles,
 )
 from bot.trader import Trader
 from strategies.base_strategy import StrategyContext
@@ -267,10 +267,11 @@ def main() -> None:
         keep_last_hours=24,
     )
 
-    market_data = build_market_data_from_local_history(
+    market_data = build_market_data_from_candles(
         history_path=history_path,
         keep_last_hours=24,
-        min_points=35,
+        candle_minutes=1,
+        min_candles=35,
     )
 
     if market_data is None:
