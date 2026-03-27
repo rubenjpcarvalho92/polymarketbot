@@ -19,16 +19,18 @@ st.set_page_config(
 )
 
 
-def load_csv(path: Path) -> pd.DataFrame:
-    if not path.exists():
+def load_csv(path):
+    import pandas as pd
+    from pathlib import Path
+
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame()
 
-    df = pd.read_csv(path)
-
-    if "timestamp" in df.columns:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-
-    return df
+    try:
+        return pd.read_csv(path, on_bad_lines="skip")
+    except Exception:
+        return pd.DataFrame()
 
 
 def format_number(value: float | int | str | None, decimals: int = 4) -> str:
