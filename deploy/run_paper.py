@@ -15,7 +15,7 @@ from bot.paper_portfolio import PaperPortfolio
 from bot.polymarket_client import PolymarketClient
 from bot.trader import Trader
 from strategies.position_sizing import (
-    PositionSizingConfig as RiskManagerConfig,
+    PositionSizingConfig,
     PositionSizingMode,
     PositionSizingState,
     PositionSizer,
@@ -79,7 +79,7 @@ def get_strategies():
     }
 
 
-def build_position_sizer_config(config: AppConfig) -> SizingConfig:
+def build_position_sizer_config(config: AppConfig) -> PositionSizingConfig:
     mode_raw = (config.position_sizing.mode or "fixed_percent").strip().lower()
 
     try:
@@ -87,7 +87,7 @@ def build_position_sizer_config(config: AppConfig) -> SizingConfig:
     except ValueError:
         mode = PositionSizingMode.FIXED_PERCENT
 
-    return SizingConfig(
+    return PositionSizingConfig(
         mode=mode,
         starting_balance=config.position_sizing.starting_balance,
         min_order_size=config.position_sizing.min_order_size,
@@ -158,7 +158,7 @@ def main() -> None:
         starting_cash=starting_cash,
     )
 
-    risk_config = build_risk_manager_config(config)
+    risk_config = build_position_sizer_config(config)
     position_sizer = PositionSizer(risk_config)
 
     portfolio_snapshot_before = portfolio.snapshot()
