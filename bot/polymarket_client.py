@@ -77,21 +77,33 @@ class PolymarketClient:
         bids = []
         asks = []
 
-        if isinstance(book, dict):
+        if hasattr(book, "bids") and hasattr(book, "asks"):
+            bids = book.bids or []
+            asks = book.asks or []
+
+            if bids:
+                best_bid_order = max(bids, key=lambda x: float(x.price))
+                best_bid = float(best_bid_order.price or 0.0)
+                bid_size = float(best_bid_order.size or 0.0)
+
+            if asks:
+                best_ask_order = min(asks, key=lambda x: float(x.price))
+                best_ask = float(best_ask_order.price or 0.0)
+                ask_size = float(best_ask_order.size or 0.0)
+
+        elif isinstance(book, dict):
             bids = book.get("bids", []) or []
             asks = book.get("asks", []) or []
 
-        if bids:
-            top_bid = bids[0]
-            if isinstance(top_bid, dict):
-                best_bid = float(top_bid.get("price", 0.0) or 0.0)
-                bid_size = float(top_bid.get("size", 0.0) or 0.0)
+            if bids:
+                best_bid_order = max(bids, key=lambda x: float(x.get("price", 0.0) or 0.0))
+                best_bid = float(best_bid_order.get("price", 0.0) or 0.0)
+                bid_size = float(best_bid_order.get("size", 0.0) or 0.0)
 
-        if asks:
-            top_ask = asks[0]
-            if isinstance(top_ask, dict):
-                best_ask = float(top_ask.get("price", 0.0) or 0.0)
-                ask_size = float(top_ask.get("size", 0.0) or 0.0)
+            if asks:
+                best_ask_order = min(asks, key=lambda x: float(x.get("price", 0.0) or 0.0))
+                best_ask = float(best_ask_order.get("price", 0.0) or 0.0)
+                ask_size = float(best_ask_order.get("size", 0.0) or 0.0)
 
         return PolymarketOrderBook(
             token_id=token_id,
