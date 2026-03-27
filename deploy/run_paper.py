@@ -388,6 +388,8 @@ def main() -> None:
         signal_strength=pre_trade_signal_strength,
     )
 
+    result = None
+
     if calculated_order_size <= 0:
         print("Calculated order size is 0. No available exposure for a new trade.")
         print()
@@ -395,40 +397,39 @@ def main() -> None:
         print("---------")
         for key, value in portfolio_snapshot_before.items():
             print(f"{key}: {value}")
-        return
+    else:
+        print(f"Calculated order size: {calculated_order_size}")
+        print()
 
-    print(f"Calculated order size: {calculated_order_size}")
-    print()
+        result = trader.process_market(
+            strategy_name=config.trading.strategy_name,
+            context=context,
+            best_bid=book.best_bid,
+            best_ask=book.best_ask,
+            order_size=calculated_order_size,
+            token_id=token_id,
+        )
 
-    result = trader.process_market(
-        strategy_name=config.trading.strategy_name,
-        context=context,
-        best_bid=book.best_bid,
-        best_ask=book.best_ask,
-        order_size=calculated_order_size,
-        token_id=token_id,
-    )
+        print("Trader decision")
+        print("---------------")
+        print(result)
+        print()
 
-    print("Trader decision")
-    print("---------------")
-    print(result)
-    print()
+        print("Open orders")
+        print("-----------")
+        for order in trader.order_manager.orders.values():
+            print(order)
 
-    signal_strength = get_signal_strength(result)
-
-    print("Open orders")
-    print("-----------")
-    for order in trader.order_manager.orders.values():
-        print(order)
-
-    print()
-    print("Positions")
-    print("---------")
-    for market_id, position in trader.state.positions.items():
-        print(market_id, position)
+        print()
+        print("Positions")
+        print("---------")
+        for market_id, position in trader.state.positions.items():
+            print(market_id, position)
 
     midpoint = (book.best_bid + book.best_ask) / 2 if book.best_bid > 0 and book.best_ask > 0 else 0.0
     timestamp_utc = datetime.now(timezone.utc).isoformat()
+
+    signal_strength = get_signal_strength(result)
 
     metadata = result.metadata if result else {}
     order_status = metadata.get("order_status", "")
@@ -502,8 +503,8 @@ def main() -> None:
             "bid_size": book.bid_size,
             "ask_size": book.ask_size,
             "midpoint": midpoint,
-            "signal": result.signal.value if result else "",
-            "reason": result.reason if result else "",
+            "signal": result.signal.value if result else "HOLD",
+            "reason": result.reason if result else "no_trade_available_exposure_blocked",
             "position_side": position_side,
             "limit_price": limit_price,
             "order_size": order_size,
