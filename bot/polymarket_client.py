@@ -16,15 +16,6 @@ class PolymarketOrderBook:
 
 
 class PolymarketClient:
-    """
-    Thin wrapper around py-clob-client.
-
-    This file is written to be safe:
-    - it only imports py-clob-client lazily
-    - it supports public read methods without forcing real trading
-    - order placement is available but controlled by execution mode
-    """
-
     def __init__(self, config: PolymarketConfig) -> None:
         self.config = config
         self._client: Any | None = None
@@ -33,12 +24,7 @@ class PolymarketClient:
         if self._client is not None:
             return self._client
 
-        try:
-            from py_clob_client.client import ClobClient
-        except ImportError as exc:
-            raise ImportError(
-                "py-clob-client is not installed. Install it before using PolymarketClient."
-            ) from exc
+        from py_clob_client.client import ClobClient
 
         client = ClobClient(
             host=self.config.host,
@@ -57,7 +43,7 @@ class PolymarketClient:
         client = self._ensure_client()
         if hasattr(client, "get_markets"):
             return client.get_markets()
-        raise NotImplementedError("This py-clob-client version does not expose get_markets().")
+        raise NotImplementedError
 
     def get_order_book(self, token_id: str) -> PolymarketOrderBook:
         client = self._ensure_client()
@@ -67,7 +53,7 @@ class PolymarketClient:
         elif hasattr(client, "get_orderbook"):
             book = client.get_orderbook(token_id)
         else:
-            raise NotImplementedError("This py-clob-client version does not expose order book methods.")
+            raise NotImplementedError
 
         best_bid = 0.0
         best_ask = 0.0
@@ -77,6 +63,7 @@ class PolymarketClient:
         bids = []
         asks = []
 
+        # 🔥 CASO REAL (py-clob-client)
         if hasattr(book, "bids") and hasattr(book, "asks"):
             bids = book.bids or []
             asks = book.asks or []
@@ -91,6 +78,7 @@ class PolymarketClient:
                 best_ask = float(best_ask_order.price or 0.0)
                 ask_size = float(best_ask_order.size or 0.0)
 
+        # fallback (dict)
         elif isinstance(book, dict):
             bids = book.get("bids", []) or []
             asks = book.get("asks", []) or []
@@ -113,13 +101,7 @@ class PolymarketClient:
             ask_size=ask_size,
         )
 
-    def place_limit_order(
-        self,
-        token_id: str,
-        side: str,
-        price: float,
-        size: float,
-    ) -> Any:
+    def place_limit_order(self, token_id: str, side: str, price: float, size: float) -> Any:
         client = self._ensure_client()
 
         if hasattr(client, "create_order"):
@@ -130,7 +112,7 @@ class PolymarketClient:
                 size=size,
             )
 
-        raise NotImplementedError("This py-clob-client version does not expose create_order().")
+        raise NotImplementedError
 
     def cancel_order(self, order_id: str) -> Any:
         client = self._ensure_client()
@@ -140,4 +122,4 @@ class PolymarketClient:
         if hasattr(client, "cancel_order"):
             return client.cancel_order(order_id)
 
-        raise NotImplementedError("This py-clob-client version does not expose cancel methods.")
+        raise NotImplementedError
