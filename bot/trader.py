@@ -54,6 +54,71 @@ class Trader:
         if result.signal == Signal.HOLD:
             return result
 
+        current_position = self.state.positions.get(context.market_id)
+
+        # ------------------------------------------------------------
+        # SELL = FECHAR TOTALMENTE A POSIÇÃO ATUAL
+        # ------------------------------------------------------------
+        if result.signal == Signal.SELL and current_position is not None and current_position.size > 0:
+            close_side = current_position.side
+            close_size = current_position.size
+
+            limit_price = self._compute_limit_price_for_exit(
+                side=close_side,
+                best_bid=best_bid,
+                best_ask=best_ask,
+            )
+
+            request = OrderRequest(
+                market_id=context.market_id,
+                side=close_side,
+                price=limit_price,
+                size=close_size,
+                strategy_name=strategy_name,
+                token_id=token_id,
+            )
+
+            order = self.execution_engine.place_limit_order(
+                request=request,
+                best_bid=best_bid,
+                best_ask=best_ask,
+            )
+
+            self.order_manager.register_order(order)
+
+            if order.status == OrderStatus.FILLED:
+                self._close_position_from_fill(order)
+
+            return StrategyResult(
+                signal=result.signal,
+                reason=result.reason,
+                metadata={
+                    **result.metadata,
+                    "action": "close_full_position",
+                    "order_id": order.order_id,
+                    "order_status": order.status.value,
+                    "limit_price": order.price,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "token_id": token_id,
+                    "closed_size": close_size,
+                    "position_side": close_side.value,
+                },
+            )
+
+        # ------------------------------------------------------------
+        # SEM POSIÇÃO PARA FECHAR -> NÃO FAZ SENTIDO VENDER
+        # ------------------------------------------------------------
+        if result.signal == Signal.SELL and current_position is None:
+            return StrategyResult(
+                signal=Signal.HOLD,
+                reason="sell_signal_but_no_open_position",
+                metadata={**result.metadata},
+            )
+
+        # ------------------------------------------------------------
+        # ENTRADA NORMAL
+        # ------------------------------------------------------------
         side_value = result.metadata.get("side")
         if side_value not in {"YES", "NO"}:
             return StrategyResult(signal=Signal.HOLD, reason="missing_side_metadata")
@@ -105,6 +170,7 @@ class Trader:
             reason=result.reason,
             metadata={
                 **result.metadata,
+                "action": "open_position",
                 "order_id": order.order_id,
                 "order_status": order.status.value,
                 "limit_price": order.price,
@@ -131,6 +197,17 @@ class Trader:
             return max(best_ask - 0.01, 0.01)
         return 0.50
 
+    def _compute_limit_price_for_exit(self, side: OrderSide, best_bid: float, best_ask: float) -> float:
+        # Para fechar posição, tenta usar o lado mais executável.
+        if side == OrderSide.YES:
+            if best_bid > 0:
+                return best_bid
+            return 0.50
+
+        if best_ask > 0:
+            return best_ask
+        return 0.50
+
     def _update_position_from_fill(self, order) -> None:
         self.state.positions[order.market_id] = Position(
             market_id=order.market_id,
@@ -139,3 +216,7 @@ class Trader:
             average_price=order.average_fill_price,
             strategy_name=order.strategy_name,
         )
+
+    def _close_position_from_fill(self, order) -> None:
+        if order.market_id in self.state.positions:
+            del self.state.positions[order.market_id]

@@ -54,7 +54,7 @@ class Order:
 class ExecutionEngine:
     """
     Supports:
-    - paper mode: simulated fills
+    - paper mode: simulated immediate fills
     - live mode: real client call, but still controlled by DRY_RUN
     """
 
@@ -104,6 +104,9 @@ class ExecutionEngine:
             mode = self.app_config.trading.trading_mode
             dry_run = self.app_config.trading.dry_run
 
+        # ------------------------------------------------------------
+        # LIVE MODE
+        # ------------------------------------------------------------
         if mode == "live" and not dry_run:
             if self.polymarket_client is None:
                 order.status = OrderStatus.REJECTED
@@ -130,19 +133,50 @@ class ExecutionEngine:
                 order.live_response = {"error": str(exc)}
                 return order
 
-        # paper / dry-run path
-        if request.side == OrderSide.YES:
-            if best_ask > 0 and request.price >= best_ask:
-                order.status = OrderStatus.FILLED
-                order.filled_size = request.size
-                order.average_fill_price = best_ask
-        elif request.side == OrderSide.NO:
-            if best_bid > 0 and request.price <= best_bid:
-                order.status = OrderStatus.FILLED
-                order.filled_size = request.size
-                order.average_fill_price = best_bid
+        # ------------------------------------------------------------
+        # PAPER MODE = IMMEDIATE FILL
+        # ------------------------------------------------------------
+        fill_price = self._get_paper_fill_price(
+            side=request.side,
+            request_price=request.price,
+            best_bid=best_bid,
+            best_ask=best_ask,
+        )
+
+        order.status = OrderStatus.FILLED
+        order.filled_size = request.size
+        order.average_fill_price = fill_price
+        order.updated_at = datetime.now(timezone.utc).isoformat()
+        order.live_response = {
+            "paper_fill": True,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+        }
 
         return order
+
+    def _get_paper_fill_price(
+        self,
+        side: OrderSide,
+        request_price: float,
+        best_bid: float,
+        best_ask: float,
+    ) -> float:
+        if side == OrderSide.YES:
+            if best_ask > 0:
+                return best_ask
+            if best_bid > 0:
+                return best_bid
+            return request_price
+
+        if side == OrderSide.NO:
+            if best_bid > 0:
+                return best_bid
+            if best_ask > 0:
+                return best_ask
+            return request_price
+
+        return request_price
 
     def cancel_order(self, order: Order) -> Order:
         if order.status in {OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.REJECTED}:

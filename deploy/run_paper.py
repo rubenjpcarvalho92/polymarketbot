@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+import requests
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,51 +28,6 @@ from strategies.macd_refined import MacdRefinedStrategy
 from strategies.rsi_vwap import RsiVwapStrategy
 
 
-def build_fake_history_from_orderbook(best_bid: float, best_ask: float) -> dict:
-    """
-    Temporary bridge:
-    until we have real candle history, create synthetic rolling series
-    around the current midpoint so the strategies can run.
-    """
-    midpoint = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0.5
-
-    closes: list[float] = []
-    highs: list[float] = []
-    lows: list[float] = []
-    volumes: list[float] = []
-
-    base = midpoint - 0.03
-
-    for i in range(220):
-        value = base + (i * 0.00025)
-
-        if i % 13 in (0, 1, 2):
-            value -= 0.002
-        elif i % 13 in (7, 8):
-            value += 0.0015
-
-        value = max(0.05, min(0.95, value))
-
-        high = min(value + 0.01, 0.99)
-        low = max(value - 0.01, 0.01)
-
-        closes.append(value)
-        highs.append(high)
-        lows.append(low)
-        volumes.append(10.0 + (i % 5))
-
-    closes[-1] = midpoint
-    highs[-1] = min(midpoint + 0.01, 0.99)
-    lows[-1] = max(midpoint - 0.01, 0.01)
-
-    return {
-        "closes": closes,
-        "highs": highs,
-        "lows": lows,
-        "volumes": volumes,
-    }
-
-
 def get_strategies():
     return {
         "macd_classic": MacdClassicStrategy(),
@@ -78,7 +35,130 @@ def get_strategies():
         "rsi_vwap": RsiVwapStrategy(),
     }
 
+def get_public_clob_host(config: AppConfig) -> str:
+    raw_host = getattr(config.polymarket, "host", None) or "https://clob.polymarket.com"
+    return str(raw_host).rstrip("/")
 
+
+def fetch_prices_history(
+    config: AppConfig,
+    token_id: str,
+    lookback_hours: int = 12,
+    interval: str = "1m",
+    fidelity: int = 1,
+) -> list[dict]:
+    host = get_public_clob_host(config)
+    end_ts = int(time.time())
+    start_ts = end_ts - (lookback_hours * 3600)
+
+    response = requests.get(
+        f"{host}/prices-history",
+        params={
+            "market": token_id,
+            "startTs": start_ts,
+            "endTs": end_ts,
+            "interval": interval,
+            "fidelity": fidelity,
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    history = payload.get("history", [])
+
+    cleaned: list[dict] = []
+    for item in history:
+        if "p" not in item:
+            continue
+        try:
+            cleaned.append(
+                {
+                    "t": int(item.get("t", 0)),
+                    "p": float(item["p"]),
+                }
+            )
+        except (TypeError, ValueError):
+            continue
+
+    return cleaned
+
+
+def fetch_spread(config: AppConfig, token_id: str) -> float:
+    host = get_public_clob_host(config)
+    response = requests.get(
+        f"{host}/spread",
+        params={"token_id": token_id},
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return float(payload.get("spread", 0.0) or 0.0)
+
+
+def fetch_last_trade_price(config: AppConfig, token_id: str) -> dict:
+    host = get_public_clob_host(config)
+    response = requests.get(
+        f"{host}/last-trade-price",
+        params={"token_id": token_id},
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+
+    return {
+        "price": float(payload.get("price", 0.0) or 0.0),
+        "side": str(payload.get("side", "") or ""),
+    }
+
+
+def build_real_history_from_prices_history(
+    config: AppConfig,
+    token_id: str,
+    best_bid: float,
+    best_ask: float,
+) -> dict:
+    points = fetch_prices_history(
+        config=config,
+        token_id=token_id,
+        lookback_hours=12,
+        interval="1m",
+        fidelity=1,
+    )
+
+    if len(points) < 35:
+        raise RuntimeError(
+            f"Not enough real price history for indicators. Got {len(points)} points, need at least 35."
+        )
+
+    closes = [float(point["p"]) for point in points]
+
+    # Fazemos highs/lows a partir de uma janela curta da própria série real.
+    # Para MACD/RSI o importante são sobretudo os closes.
+    highs: list[float] = []
+    lows: list[float] = []
+    volumes: list[float] = []
+
+    rolling_window = 5
+    for i, close in enumerate(closes):
+        start = max(0, i - rolling_window + 1)
+        window_prices = closes[start : i + 1]
+        highs.append(max(window_prices))
+        lows.append(min(window_prices))
+        volumes.append(1.0)
+
+    midpoint = (best_bid + best_ask) / 2 if best_bid > 0 and best_ask > 0 else 0.0
+    if midpoint > 0:
+        closes[-1] = midpoint
+        highs[-1] = max(highs[-1], midpoint)
+        lows[-1] = min(lows[-1], midpoint)
+
+    return {
+        "closes": closes,
+        "highs": highs,
+        "lows": lows,
+        "volumes": volumes,
+    }
 def build_position_sizer_config(config: AppConfig) -> PositionSizingConfig:
     mode_raw = (config.position_sizing.mode or "fixed_percent").strip().lower()
 
@@ -145,6 +225,13 @@ def get_signal_strength(result) -> str:
 
 def main() -> None:
     config = load_config()
+    spread = fetch_spread(config, config.trading.default_token_id)
+    last_trade = fetch_last_trade_price(config, config.trading.default_token_id)
+
+    print(f"spread   : {spread}")
+    print(f"last_px  : {last_trade['price']}")
+    print(f"last_side: {last_trade['side']}")
+    print()
 
     if not config.trading.default_token_id:
         print("DEFAULT_TOKEN_ID is empty in .env")
@@ -201,7 +288,12 @@ def main() -> None:
         execution_engine=execution_engine,
     )
 
-    market_data = build_fake_history_from_orderbook(book.best_bid, book.best_ask)
+    market_data = build_real_history_from_prices_history(
+        config=config,
+        token_id=config.trading.default_token_id,
+        best_bid=book.best_bid,
+        best_ask=book.best_ask,
+    )
 
     context = StrategyContext(
         market_id=config.trading.default_token_id,
@@ -282,6 +374,9 @@ def main() -> None:
     portfolio_snapshot = portfolio.snapshot()
 
     cycle_fields = [
+        "spread",
+        "last_trade_price",
+        "last_trade_side",
         "timestamp",
         "token_id",
         "strategy",
@@ -313,6 +408,9 @@ def main() -> None:
         "logs/cycles.csv",
         cycle_fields,
         {
+            "spread": spread,
+            "last_trade_price": last_trade["price"],
+            "last_trade_side": last_trade["side"],
             "timestamp": timestamp_utc,
             "token_id": config.trading.default_token_id,
             "strategy": config.trading.strategy_name,
