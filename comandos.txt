@@ -23,7 +23,7 @@ tail -n 5 logs/trades.csv
 echo .env >> .gitignore
 git rm --cached .env
 git add .
-git commit -m "mx exposure maximizado"
+git commit -m "debug markets adicionado"
 git push origin main
 
 #Endereço do dashboard
@@ -31,7 +31,6 @@ http://65.108.244.109:8501/
 
 #fazer pull
 cd /root/polymarketbot
-git checkout -- .env
 git pull origin main
 sudo systemctl restart polymarketbot
 tail -f logs/bot.log
@@ -40,3 +39,11 @@ tail -f logs/bot.log
 cd /root/polymarketbot
 source .venv/bin/activate
 streamlit run NOME_DO_FICHEIRO.py --server.address 0.0.0.0 --server.port 8501
+
+#estado do trading
+tail -n 1 /root/polymarketbot/logs/portfolio.csv
+
+#avaliar mercados
+cd /root/polymarketbot
+source .venv/bin/activate
+python -m scripts.scan_markets
