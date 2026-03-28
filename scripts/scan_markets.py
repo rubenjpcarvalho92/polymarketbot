@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import Any
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from bot.config import load_config
 from bot.polymarket_client import PolymarketClient
@@ -78,21 +84,24 @@ def extract_tokens(market: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def has_valid_book(best_bid: float, best_ask: float) -> bool:
+    return best_bid > 0 and best_ask > 0 and best_ask > best_bid
+
+
 def is_interesting(best_bid: float, best_ask: float, liquidity: float) -> bool:
-    if best_bid <= 0 or best_ask <= 0:
-        return False
-    if best_ask <= best_bid:
+    if not has_valid_book(best_bid, best_ask):
         return False
 
     spread = best_ask - best_bid
 
-    if spread > 0.03:
+    # filtros mais relaxados para diagnóstico
+    if spread > 0.08:
         return False
-    if liquidity < 10000:
+    if liquidity < 1000:
         return False
-    if best_bid < 0.05:
+    if best_bid < 0.02:
         return False
-    if best_ask > 0.95:
+    if best_ask > 0.98:
         return False
 
     return True
@@ -103,6 +112,20 @@ def score_market(best_bid: float, best_ask: float, liquidity: float) -> float:
     if spread <= 0:
         return 0.0
     return liquidity / spread
+
+
+def print_market_block(index: int, item: dict[str, Any]) -> None:
+    print(f"{index}. {item['question']}")
+    print(f"   outcome   : {item['label']}")
+    print(f"   token_id  : {item['token_id']}")
+    print(f"   best_bid  : {item['best_bid']:.4f}")
+    print(f"   best_ask  : {item['best_ask']:.4f}")
+    print(f"   spread    : {item['spread']:.4f}")
+    print(f"   bid_size  : {item['bid_size']:.2f}")
+    print(f"   ask_size  : {item['ask_size']:.2f}")
+    print(f"   liquidity : {item['liquidity']:.2f}")
+    print(f"   score     : {item['score']:.2f}")
+    print("-" * 80)
 
 
 def main() -> None:
@@ -122,13 +145,21 @@ def main() -> None:
     else:
         market_items = markets or []
 
-    results: list[dict[str, Any]] = []
+    all_results: list[dict[str, Any]] = []
+    filtered_results: list[dict[str, Any]] = []
+
+    scanned_markets = 0
+    scanned_tokens = 0
+    valid_books = 0
 
     for market in market_items:
+        scanned_markets += 1
         question = extract_market_question(market)
         tokens = extract_tokens(market)
 
         for token in tokens:
+            scanned_tokens += 1
+
             token_id = token["token_id"]
             label = token["label"]
 
@@ -143,45 +174,70 @@ def main() -> None:
             ask_size = to_float(book.ask_size)
             liquidity = bid_size + ask_size
 
-            if not is_interesting(best_bid, best_ask, liquidity):
+            if not has_valid_book(best_bid, best_ask):
                 continue
 
-            results.append(
-                {
-                    "question": question,
-                    "label": label,
-                    "token_id": token_id,
-                    "best_bid": best_bid,
-                    "best_ask": best_ask,
-                    "spread": best_ask - best_bid,
-                    "bid_size": bid_size,
-                    "ask_size": ask_size,
-                    "liquidity": liquidity,
-                    "score": score_market(best_bid, best_ask, liquidity),
-                }
-            )
+            valid_books += 1
 
-    results.sort(key=lambda x: x["score"], reverse=True)
+            item = {
+                "question": question,
+                "label": label,
+                "token_id": token_id,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread": best_ask - best_bid,
+                "bid_size": bid_size,
+                "ask_size": ask_size,
+                "liquidity": liquidity,
+                "score": score_market(best_bid, best_ask, liquidity),
+            }
+
+            all_results.append(item)
+
+            if is_interesting(best_bid, best_ask, liquidity):
+                filtered_results.append(item)
+
+    filtered_results.sort(key=lambda x: x["score"], reverse=True)
+    by_liquidity = sorted(all_results, key=lambda x: x["liquidity"], reverse=True)
+    by_spread = sorted(all_results, key=lambda x: x["spread"])
 
     print()
-    print("TOP 10 MARKETS")
+    print("SUMMARY")
     print("=" * 80)
+    print(f"Markets scanned : {scanned_markets}")
+    print(f"Tokens scanned  : {scanned_tokens}")
+    print(f"Valid books     : {valid_books}")
+    print(f"Passed filters  : {len(filtered_results)}")
 
-    for i, item in enumerate(results[:10], start=1):
-        print(f"{i}. {item['question']}")
-        print(f"   outcome   : {item['label']}")
-        print(f"   token_id  : {item['token_id']}")
-        print(f"   best_bid  : {item['best_bid']:.4f}")
-        print(f"   best_ask  : {item['best_ask']:.4f}")
-        print(f"   spread    : {item['spread']:.4f}")
-        print(f"   bid_size  : {item['bid_size']:.2f}")
-        print(f"   ask_size  : {item['ask_size']:.2f}")
-        print(f"   liquidity : {item['liquidity']:.2f}")
-        print(f"   score     : {item['score']:.2f}")
+    print()
+    print("TOP 10 FILTERED MARKETS")
+    print("=" * 80)
+    if filtered_results:
+        for i, item in enumerate(filtered_results[:10], start=1):
+            print_market_block(i, item)
+    else:
+        print("No interesting markets found with current filters.")
         print("-" * 80)
 
-    if not results:
-        print("No interesting markets found with current filters.")
+    print()
+    print("TOP 10 BY LIQUIDITY")
+    print("=" * 80)
+    if by_liquidity:
+        for i, item in enumerate(by_liquidity[:10], start=1):
+            print_market_block(i, item)
+    else:
+        print("No markets with valid order book found.")
+        print("-" * 80)
+
+    print()
+    print("TOP 10 BY LOWEST SPREAD")
+    print("=" * 80)
+    if by_spread:
+        for i, item in enumerate(by_spread[:10], start=1):
+            print_market_block(i, item)
+    else:
+        print("No markets with valid order book found.")
+        print("-" * 80)
 
 
 if __name__ == "__main__":
