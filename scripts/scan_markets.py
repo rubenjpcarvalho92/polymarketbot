@@ -84,6 +84,29 @@ def extract_tokens(market: Any) -> list[dict[str, Any]]:
     return normalized
 
 
+def is_tradeable_market(market: Any) -> bool:
+    if isinstance(market, dict):
+        active = bool(market.get("active", False))
+        closed = bool(market.get("closed", False))
+        archived = bool(market.get("archived", False))
+        accepting_orders = bool(market.get("accepting_orders", False))
+        enable_order_book = bool(market.get("enable_order_book", False))
+    else:
+        active = bool(getattr(market, "active", False))
+        closed = bool(getattr(market, "closed", False))
+        archived = bool(getattr(market, "archived", False))
+        accepting_orders = bool(getattr(market, "accepting_orders", False))
+        enable_order_book = bool(getattr(market, "enable_order_book", False))
+
+    return (
+        active
+        and not closed
+        and not archived
+        and accepting_orders
+        and enable_order_book
+    )
+
+
 def has_valid_book(best_bid: float, best_ask: float) -> bool:
     return best_bid > 0 and best_ask > 0 and best_ask > best_bid
 
@@ -94,7 +117,6 @@ def is_interesting(best_bid: float, best_ask: float, liquidity: float) -> bool:
 
     spread = best_ask - best_bid
 
-    # filtros mais relaxados para diagnóstico
     if spread > 0.08:
         return False
     if liquidity < 1000:
@@ -149,11 +171,17 @@ def main() -> None:
     filtered_results: list[dict[str, Any]] = []
 
     scanned_markets = 0
+    tradeable_markets = 0
     scanned_tokens = 0
     valid_books = 0
 
     for market in market_items:
         scanned_markets += 1
+
+        if not is_tradeable_market(market):
+            continue
+
+        tradeable_markets += 1
         question = extract_market_question(market)
         tokens = extract_tokens(market)
 
@@ -204,10 +232,11 @@ def main() -> None:
     print()
     print("SUMMARY")
     print("=" * 80)
-    print(f"Markets scanned : {scanned_markets}")
-    print(f"Tokens scanned  : {scanned_tokens}")
-    print(f"Valid books     : {valid_books}")
-    print(f"Passed filters  : {len(filtered_results)}")
+    print(f"Markets scanned   : {scanned_markets}")
+    print(f"Tradeable markets : {tradeable_markets}")
+    print(f"Tokens scanned    : {scanned_tokens}")
+    print(f"Valid books       : {valid_books}")
+    print(f"Passed filters    : {len(filtered_results)}")
 
     print()
     print("TOP 10 FILTERED MARKETS")
