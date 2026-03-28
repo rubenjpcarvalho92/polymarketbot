@@ -39,10 +39,15 @@ class PolymarketClient:
         client = self._ensure_client()
         return client is not None
 
-    def get_markets(self) -> Any:
+    def get_markets(self, next_cursor: str = "MA==") -> Any:
         client = self._ensure_client()
+
         if hasattr(client, "get_markets"):
-            return client.get_markets()
+            try:
+                return client.get_markets(next_cursor)
+            except TypeError:
+                return client.get_markets()
+
         raise NotImplementedError
 
     def get_order_book(self, token_id: str) -> PolymarketOrderBook:
@@ -63,7 +68,6 @@ class PolymarketClient:
         bids = []
         asks = []
 
-        # 🔥 CASO REAL (py-clob-client)
         if hasattr(book, "bids") and hasattr(book, "asks"):
             bids = book.bids or []
             asks = book.asks or []
@@ -78,7 +82,6 @@ class PolymarketClient:
                 best_ask = float(best_ask_order.price or 0.0)
                 ask_size = float(best_ask_order.size or 0.0)
 
-        # fallback (dict)
         elif isinstance(book, dict):
             bids = book.get("bids", []) or []
             asks = book.get("asks", []) or []
