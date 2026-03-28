@@ -21,6 +21,23 @@ def to_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def extract_items_and_cursor(markets: Any) -> tuple[list[Any], str | None]:
+    if isinstance(markets, dict):
+        items = (
+            markets.get("data")
+            or markets.get("markets")
+            or markets.get("items")
+            or []
+        )
+        next_cursor = (
+            markets.get("next_cursor")
+            or markets.get("nextCursor")
+            or markets.get("cursor")
+        )
+        return items, next_cursor
+    return list(markets or []), None
+
+
 def extract_market_question(market: Any) -> str:
     if isinstance(market, dict):
         return (
@@ -154,76 +171,89 @@ def main() -> None:
     config = load_config()
     client = PolymarketClient(config.polymarket)
 
-    print("Fetching markets...")
-    markets = client.get_markets()
-
-    if isinstance(markets, dict):
-        market_items = (
-            markets.get("data")
-            or markets.get("markets")
-            or markets.get("items")
-            or []
-        )
-    else:
-        market_items = markets or []
+    max_pages = 10
+    cursor = "MA=="
+    seen_cursors: set[str] = set()
 
     all_results: list[dict[str, Any]] = []
     filtered_results: list[dict[str, Any]] = []
 
-    scanned_markets = 0
+    pages_scanned = 0
+    markets_scanned = 0
     tradeable_markets = 0
-    scanned_tokens = 0
+    tokens_scanned = 0
     valid_books = 0
 
-    for market in market_items:
-        scanned_markets += 1
+    print("Fetching markets...")
 
-        if not is_tradeable_market(market):
-            continue
+    while pages_scanned < max_pages and cursor and cursor not in seen_cursors:
+        seen_cursors.add(cursor)
+        pages_scanned += 1
 
-        tradeable_markets += 1
-        question = extract_market_question(market)
-        tokens = extract_tokens(market)
+        print(f"Scanning page {pages_scanned} with cursor={cursor}")
+        response = client.get_markets(cursor)
+        market_items, next_cursor = extract_items_and_cursor(response)
 
-        for token in tokens:
-            scanned_tokens += 1
+        if not market_items:
+            break
 
-            token_id = token["token_id"]
-            label = token["label"]
+        for market in market_items:
+            markets_scanned += 1
 
-            try:
-                book = client.get_order_book(token_id)
-            except Exception:
+            if not is_tradeable_market(market):
                 continue
 
-            best_bid = to_float(book.best_bid)
-            best_ask = to_float(book.best_ask)
-            bid_size = to_float(book.bid_size)
-            ask_size = to_float(book.ask_size)
-            liquidity = bid_size + ask_size
+            tradeable_markets += 1
+            question = extract_market_question(market)
+            tokens = extract_tokens(market)
 
-            if not has_valid_book(best_bid, best_ask):
-                continue
+            for token in tokens:
+                tokens_scanned += 1
+                token_id = token["token_id"]
+                label = token["label"]
 
-            valid_books += 1
+                try:
+                    book = client.get_order_book(token_id)
+                except Exception:
+                    continue
 
-            item = {
-                "question": question,
-                "label": label,
-                "token_id": token_id,
-                "best_bid": best_bid,
-                "best_ask": best_ask,
-                "spread": best_ask - best_bid,
-                "bid_size": bid_size,
-                "ask_size": ask_size,
-                "liquidity": liquidity,
-                "score": score_market(best_bid, best_ask, liquidity),
-            }
+                best_bid = to_float(book.best_bid)
+                best_ask = to_float(book.best_ask)
+                bid_size = to_float(book.bid_size)
+                ask_size = to_float(book.ask_size)
+                liquidity = bid_size + ask_size
 
-            all_results.append(item)
+                if not has_valid_book(best_bid, best_ask):
+                    continue
 
-            if is_interesting(best_bid, best_ask, liquidity):
-                filtered_results.append(item)
+                valid_books += 1
+
+                item = {
+                    "question": question,
+                    "label": label,
+                    "token_id": token_id,
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "spread": best_ask - best_bid,
+                    "bid_size": bid_size,
+                    "ask_size": ask_size,
+                    "liquidity": liquidity,
+                    "score": score_market(best_bid, best_ask, liquidity),
+                }
+
+                all_results.append(item)
+
+                if is_interesting(best_bid, best_ask, liquidity):
+                    filtered_results.append(item)
+
+        if not next_cursor or next_cursor == cursor:
+            break
+
+        cursor = next_cursor
+
+        # parar cedo se já encontrámos suficientes
+        if len(filtered_results) >= 10:
+            break
 
     filtered_results.sort(key=lambda x: x["score"], reverse=True)
     by_liquidity = sorted(all_results, key=lambda x: x["liquidity"], reverse=True)
@@ -232,9 +262,10 @@ def main() -> None:
     print()
     print("SUMMARY")
     print("=" * 80)
-    print(f"Markets scanned   : {scanned_markets}")
+    print(f"Pages scanned     : {pages_scanned}")
+    print(f"Markets scanned   : {markets_scanned}")
     print(f"Tradeable markets : {tradeable_markets}")
-    print(f"Tokens scanned    : {scanned_tokens}")
+    print(f"Tokens scanned    : {tokens_scanned}")
     print(f"Valid books       : {valid_books}")
     print(f"Passed filters    : {len(filtered_results)}")
 
