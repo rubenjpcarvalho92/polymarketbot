@@ -162,6 +162,82 @@ def fetch_last_trade_price(config: AppConfig, token_id: str) -> dict:
         return {"price": 0.0, "side": ""}
 
 
+def fetch_prices_history_from_api(
+    config: AppConfig,
+    token_id: str,
+    interval: str = "1d",
+    fidelity: int = 60,
+) -> list[float]:
+    host = get_public_clob_host(config)
+
+    try:
+        response = requests.get(
+            f"{host}/prices-history",
+            params={
+                "market": token_id,
+                "interval": interval,
+                "fidelity": fidelity,
+            },
+            timeout=20,
+        )
+
+        if response.status_code != 200:
+            print(f"WARNING: prices-history HTTP {response.status_code} for token {token_id}")
+            return []
+
+        payload = response.json()
+        history = payload.get("history", [])
+        if not isinstance(history, list):
+            return []
+
+        prices: list[float] = []
+        for row in history:
+            if not isinstance(row, dict):
+                continue
+            p = safe_float(row.get("p"), default=-1.0)
+            if p > 0:
+                prices.append(p)
+
+        return prices
+
+    except Exception as exc:
+        print(f"WARNING: prices-history fetch failed for token {token_id}: {exc}")
+        return []
+
+
+def build_market_data_from_api_prices(prices: list[float]) -> Optional[dict]:
+    if len(prices) < 35:
+        return None
+
+    closes: list[float] = []
+    highs: list[float] = []
+    lows: list[float] = []
+    volumes: list[float] = []
+
+    for i, price in enumerate(prices):
+        prev_price = prices[i - 1] if i > 0 else price
+        next_price = prices[i + 1] if i < len(prices) - 1 else price
+
+        hi = max(price, prev_price, next_price)
+        lo = min(price, prev_price, next_price)
+
+        pad = max(0.0005, price * 0.0025)
+        high = min(0.999, hi + pad)
+        low = max(0.001, lo - pad)
+
+        closes.append(price)
+        highs.append(high)
+        lows.append(low)
+        volumes.append(10.0 + (i % 7))
+
+    return {
+        "closes": closes,
+        "highs": highs,
+        "lows": lows,
+        "volumes": volumes,
+    }
+
+
 def build_position_sizer_config(config: AppConfig) -> PositionSizingConfig:
     mode_raw = (config.position_sizing.mode or "fixed_percent").strip().lower()
 
@@ -334,10 +410,20 @@ def resolve_open_position_side(portfolio, token_id: str) -> str:
     return str(side or "")
 
 
+def build_trader(config: AppConfig, client: PolymarketClient) -> Trader:
+    execution_engine = ExecutionEngine(
+        app_config=config,
+        polymarket_client=client,
+    )
+    return Trader(
+        strategies=get_strategies(),
+        execution_engine=execution_engine,
+    )
+
+
 def evaluate_token(
     *,
     config: AppConfig,
-    trader: Trader,
     client: PolymarketClient,
     token_id: str,
     market_name: str,
@@ -373,14 +459,25 @@ def evaluate_token(
         keep_last_hours=24,
     )
 
-    market_data = build_market_data_from_candles(
-        history_path=history_path,
-        keep_last_hours=24,
-        candle_minutes=1,
-        min_candles=35,
+    api_prices = fetch_prices_history_from_api(
+        config=config,
+        token_id=token_id,
+        interval="1d",
+        fidelity=60,
     )
 
-    history_source = "local_raw+api_bootstrap"
+    market_data = build_market_data_from_api_prices(api_prices)
+    history_source = "api_prices_history"
+
+    if market_data is None:
+        market_data = build_market_data_from_candles(
+            history_path=history_path,
+            keep_last_hours=24,
+            candle_minutes=1,
+            min_candles=35,
+        )
+        history_source = "local_raw+api_bootstrap"
+
     if market_data is None:
         history_source = "synthetic_fallback"
         market_data = build_fake_history_from_orderbook(book.best_bid, book.best_ask)
@@ -399,7 +496,8 @@ def evaluate_token(
 
     result = None
     if calculated_order_size > 0:
-        result = trader.process_market(
+        local_trader = build_trader(config, client)
+        result = local_trader.process_market(
             strategy_name=config.trading.strategy_name,
             context=context,
             best_bid=book.best_bid,
@@ -407,6 +505,8 @@ def evaluate_token(
             order_size=calculated_order_size,
             token_id=token_id,
         )
+    else:
+        local_trader = None
 
     midpoint = (book.best_bid + book.best_ask) / 2 if book.best_bid > 0 and book.best_ask > 0 else 0.0
 
@@ -419,9 +519,11 @@ def evaluate_token(
         "book": book,
         "history_path": history_path,
         "history_source": history_source,
+        "api_history_points": len(api_prices),
         "calculated_order_size": calculated_order_size,
         "result": result,
         "midpoint": midpoint,
+        "trader": local_trader,
     }
 
 
@@ -452,14 +554,6 @@ def main() -> None:
     print()
 
     client = PolymarketClient(config.polymarket)
-    execution_engine = ExecutionEngine(
-        app_config=config,
-        polymarket_client=client,
-    )
-    trader = Trader(
-        strategies=get_strategies(),
-        execution_engine=execution_engine,
-    )
 
     current_open_token_id = resolve_open_position_token_id(portfolio)
     current_open_side = resolve_open_position_side(portfolio, current_open_token_id) if current_open_token_id else ""
@@ -467,7 +561,7 @@ def main() -> None:
     selected_token_id: Optional[str] = None
     selected_market_name: str = ""
     selected_outcome: str = ""
-    candidate_mode = False
+    selected_evaluation: Optional[dict] = None
 
     if current_open_token_id:
         selected_token_id = current_open_token_id
@@ -495,11 +589,8 @@ def main() -> None:
             selected_market_name = selected_token_id
             selected_outcome = ""
         else:
-            candidate_mode = True
             print("Candidate evaluation")
             print("--------------------")
-
-            selected_evaluation = None
 
             for idx, candidate in enumerate(candidates, start=1):
                 passes_candidate_filter, candidate_reason = basic_buy_candidate_filter(candidate)
@@ -520,7 +611,6 @@ def main() -> None:
 
                 evaluation = evaluate_token(
                     config=config,
-                    trader=trader,
                     client=client,
                     token_id=candidate.token_id,
                     market_name=candidate.market_name,
@@ -542,6 +632,7 @@ def main() -> None:
                 print(f"    Last trade px    : {last_trade['price']}")
                 print(f"    Last trade side  : {last_trade['side']}")
                 print(f"    History source   : {evaluation['history_source']}")
+                print(f"    API hist points  : {evaluation['api_history_points']}")
                 print(f"    History file     : {evaluation['history_path'].name}")
                 print(f"    Calc order size  : {evaluation['calculated_order_size']}")
 
@@ -580,23 +671,25 @@ def main() -> None:
         print("No token selected.")
         return
 
-    # Avaliação final do token escolhido / posição aberta
-    final_evaluation = evaluate_token(
-        config=config,
-        trader=trader,
-        client=client,
-        token_id=selected_token_id,
-        market_name=selected_market_name,
-        outcome=selected_outcome,
-        position_sizer=position_sizer,
-        position_state=position_state,
-    )
+    if selected_evaluation is None:
+        final_evaluation = evaluate_token(
+            config=config,
+            client=client,
+            token_id=selected_token_id,
+            market_name=selected_market_name,
+            outcome=selected_outcome,
+            position_sizer=position_sizer,
+            position_state=position_state,
+        )
+    else:
+        final_evaluation = selected_evaluation
 
     spread = final_evaluation["spread"]
     last_trade = final_evaluation["last_trade"]
     book = final_evaluation["book"]
     result = final_evaluation["result"]
     midpoint = final_evaluation["midpoint"]
+    trader_for_final = final_evaluation["trader"]
 
     print(f"spread   : {spread}")
     print(f"last_px  : {last_trade['price']}")
@@ -604,10 +697,11 @@ def main() -> None:
     print()
 
     if final_evaluation["history_source"] == "synthetic_fallback":
-        print("WARNING: insufficient local history. Falling back to synthetic history for this cycle.")
+        print("WARNING: insufficient real history. Falling back to synthetic history for this cycle.")
     else:
         print(
             f"History source      : {final_evaluation['history_source']}\n"
+            f"API hist points     : {final_evaluation['api_history_points']}\n"
             f"History file        : {final_evaluation['history_path'].name}\n"
             f"History window      : 24h"
         )
@@ -642,14 +736,16 @@ def main() -> None:
 
     print("Open orders")
     print("-----------")
-    for order in trader.order_manager.orders.values():
-        print(order)
+    if trader_for_final is not None:
+        for order in trader_for_final.order_manager.orders.values():
+            print(order)
 
     print()
     print("Positions")
     print("---------")
-    for market_id, position in trader.state.positions.items():
-        print(market_id, position)
+    if trader_for_final is not None:
+        for market_id, position in trader_for_final.state.positions.items():
+            print(market_id, position)
 
     signal_strength = get_signal_strength(result)
 
