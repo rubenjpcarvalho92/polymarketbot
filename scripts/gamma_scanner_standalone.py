@@ -1,4 +1,4 @@
-# gamma_scanner_standalone.py
+# scripts/gamma_scanner_standalone.py
 from __future__ import annotations
 
 import json
@@ -52,7 +52,7 @@ class GammaScanner:
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "gamma-scanner-standalone/1.0",
+                "User-Agent": "gamma-scanner-standalone/1.1",
             }
         )
 
@@ -117,8 +117,6 @@ class GammaScanner:
         self,
         page_size: int = 100,
         max_pages: int = 2,
-        order: str = "volume_24hr",
-        ascending: bool = False,
         sleep_between_pages: float = 0.0,
     ) -> List[Dict[str, Any]]:
         events: List[Dict[str, Any]] = []
@@ -130,9 +128,8 @@ class GammaScanner:
                 "closed": "false",
                 "limit": page_size,
                 "offset": offset,
-                "order": order,
-                "ascending": str(ascending).lower(),
             }
+
             batch = self._get("/events", params=params)
 
             if not isinstance(batch, list):
@@ -165,8 +162,6 @@ class GammaScanner:
         events = self.fetch_active_events(
             page_size=page_size,
             max_pages=max_pages,
-            order="volume_24hr",
-            ascending=False,
         )
 
         results: List[MarketRow] = []
@@ -198,10 +193,10 @@ class GammaScanner:
                 if closed is True or archived is True or active is False:
                     continue
 
-                liquidity = self._to_float(self._first_non_empty(market, ["liquidity", "liquidityNum"]))
-                volume = self._to_float(self._first_non_empty(market, ["volume", "volumeNum"]))
+                liquidity = self._to_float(self._first_non_empty(market, ["liquidity", "liquidityNum", "liquidityClob"]))
+                volume = self._to_float(self._first_non_empty(market, ["volume", "volumeNum", "volumeClob"]))
                 volume_24hr = self._to_float(
-                    self._first_non_empty(market, ["volume24hr", "volume_24hr", "oneDayVolume", "one_day_volume"])
+                    self._first_non_empty(market, ["volume24hr", "volume_24hr", "oneDayVolume", "one_day_volume", "volume24hrClob"])
                 )
 
                 if liquidity < min_liquidity:
@@ -209,26 +204,40 @@ class GammaScanner:
                 if volume_24hr < min_volume_24hr:
                     continue
 
-                tokens = market.get("tokens") or []
-                yes_token = self._extract_token(tokens, "yes")
-                no_token = self._extract_token(tokens, "no")
-
-                yes_token_id = yes_token.get("token_id")
-                no_token_id = no_token.get("token_id")
-
+                yes_token_id = None
+                no_token_id = None
                 yes_price = None
                 no_price = None
 
-                if yes_token.get("price") is not None:
-                    try:
-                        yes_price = float(yes_token["price"])
-                    except (TypeError, ValueError):
-                        pass
+                tokens = market.get("tokens") or []
+                if isinstance(tokens, list) and tokens:
+                    yes_token = self._extract_token(tokens, "yes")
+                    no_token = self._extract_token(tokens, "no")
 
-                if no_token.get("price") is not None:
+                    yes_token_id = yes_token.get("token_id")
+                    no_token_id = no_token.get("token_id")
+
+                    if yes_token.get("price") is not None:
+                        try:
+                            yes_price = float(yes_token["price"])
+                        except (TypeError, ValueError):
+                            pass
+
+                    if no_token.get("price") is not None:
+                        try:
+                            no_price = float(no_token["price"])
+                        except (TypeError, ValueError):
+                            pass
+
+                # fallback: alguns payloads trazem clobTokenIds mas não trazem tokens[]
+                if (not yes_token_id or not no_token_id) and market.get("clobTokenIds"):
+                    raw = market.get("clobTokenIds")
                     try:
-                        no_price = float(no_token["price"])
-                    except (TypeError, ValueError):
+                        parsed = json.loads(raw) if isinstance(raw, str) else raw
+                        if isinstance(parsed, list) and len(parsed) >= 2:
+                            yes_token_id = yes_token_id or str(parsed[0])
+                            no_token_id = no_token_id or str(parsed[1])
+                    except Exception:
                         pass
 
                 market_slug = self._first_non_empty(market, ["slug"])
@@ -262,8 +271,8 @@ class GammaScanner:
                         no_token_id=str(no_token_id) if no_token_id is not None else None,
                         yes_price=yes_price,
                         no_price=no_price,
-                        start_date_iso=self._first_non_empty(market, ["startDate", "start_date", "start_date_iso"]),
-                        end_date_iso=self._first_non_empty(market, ["endDate", "end_date", "end_date_iso"]),
+                        start_date_iso=self._first_non_empty(market, ["startDate", "start_date", "start_date_iso", "startDateIso"]),
+                        end_date_iso=self._first_non_empty(market, ["endDate", "end_date", "end_date_iso", "endDateIso"]),
                         score=score,
                     )
                 )
