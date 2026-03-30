@@ -165,6 +165,14 @@ def safe_float(value, default: float = 0.0) -> float:
         return default
 
 
+def split_position_key(raw_key: str) -> tuple[str, str]:
+    text = str(raw_key or "").strip()
+    if ":" in text:
+        token_id, side = text.rsplit(":", 1)
+        return token_id.strip(), side.strip().upper()
+    return text, ""
+
+
 def fetch_spread(config: AppConfig, token_id: str) -> float:
     host = get_public_clob_host(config)
 
@@ -442,22 +450,34 @@ def resolve_open_position_token_id(portfolio) -> Optional[str]:
     if not positions:
         return None
 
-    for token_id, position in positions.items():
+    for raw_key, position in positions.items():
         size = float(getattr(position, "size", 0.0) or 0.0)
         if size > 0:
-            return str(token_id)
+            token_id, _ = split_position_key(str(raw_key))
+            return token_id
 
     return None
 
 
 def resolve_open_position_side(portfolio, token_id: str) -> str:
     positions = getattr(portfolio, "positions", {}) or {}
-    position = positions.get(token_id)
-    if position is None:
+    if not positions:
         return ""
 
-    side = getattr(position, "side", "")
-    return str(side or "")
+    for raw_key, position in positions.items():
+        size = float(getattr(position, "size", 0.0) or 0.0)
+        if size <= 0:
+            continue
+
+        parsed_token_id, parsed_side = split_position_key(str(raw_key))
+        if parsed_token_id == token_id:
+            if parsed_side:
+                return parsed_side
+
+            side = getattr(position, "side", "")
+            return str(side or "").strip().upper()
+
+    return ""
 
 
 def build_trader(config: AppConfig, client: PolymarketClient) -> Trader:
