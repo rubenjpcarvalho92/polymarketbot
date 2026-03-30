@@ -23,7 +23,7 @@ tail -n 5 logs/trades.csv
 echo .env >> .gitignore
 git rm --cached .env
 git add .
-git commit -m "teste clob direcionado para compra"
+git commit -m "Bot com decisao de mercado"
 git push origin main
 
 #Endereço do dashboard
@@ -64,4 +64,8 @@ source .venv/bin/activate
 python scripts/clob_market_analyzer_standalone.py
 
 
-104731530598978202925563656323694933154318837341770296468059903473029914991939
+#procura de mercado
+cd /root/polymarketbot
+source .venv/bin/activate
+python scripts/gamma_scanner_standalone.py
+python scripts/clob_market_analyzer_standalone.py
