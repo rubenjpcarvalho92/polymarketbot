@@ -23,7 +23,7 @@ tail -n 5 logs/trades.csv
 echo .env >> .gitignore
 git rm --cached .env
 git add .
-git commit -m "Bot com decisao de mercado"
+git commit -m "Rum paper com pesquisa optimizada v4"
 git push origin main
 
 #Endereço do dashboard
@@ -69,3 +69,4 @@ cd /root/polymarketbot
 source .venv/bin/activate
 python scripts/gamma_scanner_standalone.py
 python scripts/clob_market_analyzer_standalone.py
+
