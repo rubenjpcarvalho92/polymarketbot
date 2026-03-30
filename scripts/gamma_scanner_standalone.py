@@ -427,7 +427,7 @@ if __name__ == "__main__":
                 "2028 presidential nomination",
                 "2028 us presidential election",
             ],
-            top_n=1000,
+            top_n=200,
         )
 
         raw_markets = result["raw"]
