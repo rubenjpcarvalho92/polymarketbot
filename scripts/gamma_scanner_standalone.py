@@ -417,7 +417,7 @@ if __name__ == "__main__":
 
         result = scanner.scan(
             page_size=100,
-            max_pages=10,
+            max_pages=100,
             min_liquidity=1000.0,
             min_volume_24hr=500.0,
             require_order_book=True,
@@ -427,7 +427,7 @@ if __name__ == "__main__":
                 "2028 presidential nomination",
                 "2028 us presidential election",
             ],
-            top_n=100,
+            top_n=1000,
         )
 
         raw_markets = result["raw"]

@@ -5,6 +5,7 @@ import math
 import statistics
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -58,9 +59,10 @@ class ClobAnalyzer:
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "clob-market-analyzer-standalone/3.0",
+                "User-Agent": "clob-market-analyzer-standalone/4.0",
             }
         )
+        self.exclusion_reasons: Counter[str] = Counter()
 
     def _get(self, path: str, params: Dict[str, Any]) -> Any:
         url = f"{CLOB_BASE_URL}{path}"
@@ -166,12 +168,12 @@ class ClobAnalyzer:
         if midpoint is None:
             return 1.5
 
-        if midpoint < 0.03 or midpoint > 0.97:
+        if midpoint < 0.02 or midpoint > 0.98:
             return 4.0
         if midpoint < 0.05 or midpoint > 0.95:
-            return 2.5
+            return 2.0
         if midpoint < 0.10 or midpoint > 0.90:
-            return 1.0
+            return 0.75
         return 0.0
 
     @staticmethod
@@ -179,11 +181,11 @@ class ClobAnalyzer:
         if spread is None:
             return 2.0
         if spread >= 0.10:
-            return 4.0
+            return 3.0
         if spread >= 0.05:
-            return 2.0
+            return 1.5
         if spread >= 0.02:
-            return 1.0
+            return 0.75
         return 0.0
 
     @staticmethod
@@ -197,23 +199,23 @@ class ClobAnalyzer:
         if midpoint is None:
             return False, "missing_midpoint"
 
-        if midpoint < 0.05 or midpoint > 0.95:
-            return False, "midpoint_extreme"
+        if midpoint < 0.02 or midpoint > 0.98:
+            return False, "midpoint_too_extreme"
 
         if spread is None:
             return False, "missing_spread"
 
-        if spread > 0.03:
+        if spread > 0.05:
             return False, "spread_too_wide"
 
-        if history_points < 10:
+        if history_points < 8:
             return False, "not_enough_history"
 
-        if volatility is None or volatility <= 0:
-            return False, "no_volatility"
+        vol_ok = volatility is not None and volatility > 0
+        move_ok = avg_abs_change is not None and avg_abs_change > 0
 
-        if avg_abs_change is None or avg_abs_change <= 0:
-            return False, "no_price_movement"
+        if not (vol_ok or move_ok):
+            return False, "no_movement"
 
         return True, "eligible"
 
@@ -331,6 +333,7 @@ class ClobAnalyzer:
         )
 
         if not eligible:
+            self.exclusion_reasons[eligibility_reason] += 1
             return None
 
         score, midpoint_penalty, spread_penalty = self._score(
@@ -453,6 +456,15 @@ class ClobAnalyzer:
             json.dump([asdict(a) for a in analyses], f, ensure_ascii=False, indent=2)
         print(f"\nJSON gravado em: {output_json}")
 
+    def print_exclusion_summary(self) -> None:
+        print("\nResumo de exclusões:\n")
+        if not self.exclusion_reasons:
+            print("Nenhuma exclusão registada.")
+            return
+
+        for reason, count in self.exclusion_reasons.most_common():
+            print(f"  - {reason}: {count}")
+
     @staticmethod
     def print_summary(analyses: List[TokenAnalysis], limit: int = 20) -> None:
         print(f"\nEncontradas {len(analyses)} análises de tokens elegíveis\n")
@@ -486,10 +498,11 @@ if __name__ == "__main__":
             input_json=INPUT_JSON,
             interval="1d",
             fidelity=60,
-            top_n=20,  # mete None para analisar tudo
+            top_n=None,  # mete um número se quiseres limitar
         )
 
         analyzer.print_summary(analyses, limit=20)
+        analyzer.print_exclusion_summary()
         analyzer.save_json(analyses, OUTPUT_JSON)
 
     except requests.HTTPError as e:
