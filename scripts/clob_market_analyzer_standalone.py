@@ -44,6 +44,10 @@ class TokenAnalysis:
     avg_abs_change: Optional[float]
     min_price: Optional[float]
     max_price: Optional[float]
+    trend_consistency: Optional[float]
+    positive_return_bonus: float
+    trend_bonus: float
+    pump_penalty: float
 
     midpoint_penalty: float
     spread_penalty: float
@@ -59,7 +63,7 @@ class ClobAnalyzer:
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "clob-market-analyzer-standalone/4.0",
+                "User-Agent": "clob-market-analyzer-standalone/5.0-buy-oriented",
             }
         )
         self.exclusion_reasons: Counter[str] = Counter()
@@ -138,6 +142,7 @@ class ClobAnalyzer:
                 "avg_abs_change": None,
                 "min_price": None,
                 "max_price": None,
+                "trend_consistency": None,
             }
 
         first_price = prices[0]
@@ -153,6 +158,9 @@ class ClobAnalyzer:
         avg_abs_change = statistics.mean(abs(x) for x in diffs) if diffs else 0.0
         volatility = statistics.pstdev(prices) if len(prices) > 1 else 0.0
 
+        positive_moves = sum(1 for d in diffs if d > 0)
+        trend_consistency = (positive_moves / len(diffs)) if diffs else 0.0
+
         return {
             "first_price": first_price,
             "last_price": last_price,
@@ -161,6 +169,7 @@ class ClobAnalyzer:
             "avg_abs_change": avg_abs_change,
             "min_price": min_price,
             "max_price": max_price,
+            "trend_consistency": trend_consistency,
         }
 
     @staticmethod
@@ -168,24 +177,71 @@ class ClobAnalyzer:
         if midpoint is None:
             return 1.5
 
-        if midpoint < 0.02 or midpoint > 0.98:
-            return 4.0
-        if midpoint < 0.05 or midpoint > 0.95:
-            return 2.0
         if midpoint < 0.10 or midpoint > 0.90:
-            return 0.75
+            return 3.0
+        if midpoint < 0.15 or midpoint > 0.85:
+            return 1.25
         return 0.0
 
     @staticmethod
     def _spread_penalty(spread: Optional[float]) -> float:
         if spread is None:
             return 2.0
-        if spread >= 0.10:
+        if spread > 0.02:
             return 3.0
-        if spread >= 0.05:
+        if spread >= 0.015:
+            return 1.25
+        if spread >= 0.01:
+            return 0.4
+        return 0.0
+
+    @staticmethod
+    def _pump_penalty(
+        history_points: int,
+        return_pct: Optional[float],
+        volatility: Optional[float],
+        avg_abs_change: Optional[float],
+        trend_consistency: Optional[float],
+    ) -> float:
+        penalty = 0.0
+
+        if return_pct is not None and return_pct > 35 and history_points < 20:
+            penalty += 2.0
+
+        if return_pct is not None and return_pct > 60:
+            penalty += 2.0
+
+        if volatility is not None and volatility > 0.10:
+            penalty += 1.5
+
+        if avg_abs_change is not None and avg_abs_change > 0.05:
+            penalty += 1.0
+
+        if trend_consistency is not None and trend_consistency < 0.50:
+            penalty += 1.25
+
+        return penalty
+
+    @staticmethod
+    def _positive_return_bonus(return_pct: Optional[float]) -> float:
+        if return_pct is None:
+            return 0.0
+        if return_pct <= 0:
+            return 0.0
+        if return_pct >= 20:
             return 1.5
-        if spread >= 0.02:
-            return 0.75
+        return 0.075 * return_pct
+
+    @staticmethod
+    def _trend_bonus(trend_consistency: Optional[float]) -> float:
+        if trend_consistency is None:
+            return 0.0
+        if trend_consistency >= 0.70:
+            return 2.0
+        if trend_consistency >= 0.60:
+            return 1.0
+        if trend_consistency >= 0.55:
+            return 0.4
         return 0.0
 
     @staticmethod
@@ -195,27 +251,41 @@ class ClobAnalyzer:
         history_points: int,
         volatility: Optional[float],
         avg_abs_change: Optional[float],
+        return_pct: Optional[float],
+        trend_consistency: Optional[float],
     ) -> tuple[bool, str]:
         if midpoint is None:
             return False, "missing_midpoint"
 
-        if midpoint < 0.02 or midpoint > 0.98:
+        if midpoint < 0.10 or midpoint > 0.90:
             return False, "midpoint_too_extreme"
 
         if spread is None:
             return False, "missing_spread"
 
-        if spread > 0.05:
+        if spread > 0.02:
             return False, "spread_too_wide"
 
-        if history_points < 8:
+        if history_points < 12:
             return False, "not_enough_history"
 
-        vol_ok = volatility is not None and volatility > 0
-        move_ok = avg_abs_change is not None and avg_abs_change > 0
+        vol_ok = volatility is not None and volatility > 0.003
+        move_ok = avg_abs_change is not None and avg_abs_change > 0.0015
 
-        if not (vol_ok or move_ok):
-            return False, "no_movement"
+        if not (vol_ok and move_ok):
+            return False, "no_meaningful_movement"
+
+        if return_pct is None:
+            return False, "missing_return"
+
+        if return_pct <= 0:
+            return False, "not_buy_trending"
+
+        if trend_consistency is None or trend_consistency < 0.50:
+            return False, "weak_trend_consistency"
+
+        if return_pct > 80:
+            return False, "too_extended"
 
         return True, "eligible"
 
@@ -230,9 +300,10 @@ class ClobAnalyzer:
         return_pct: Optional[float],
         volatility: Optional[float],
         avg_abs_change: Optional[float],
-    ) -> Tuple[float, float, float]:
+        trend_consistency: Optional[float],
+    ) -> Tuple[float, float, float, float, float, float]:
         history_term = math.log1p(max(history_points, 0))
-        return_term = min(abs(return_pct), 25.0) if return_pct is not None else 0.0
+        capped_return = min(return_pct, 25.0) if return_pct is not None else 0.0
         vol_term = volatility or 0.0
         change_term = avg_abs_change or 0.0
 
@@ -242,20 +313,39 @@ class ClobAnalyzer:
 
         midpoint_penalty = ClobAnalyzer._midpoint_extreme_penalty(midpoint)
         spread_penalty = ClobAnalyzer._spread_penalty(spread)
+        pump_penalty = ClobAnalyzer._pump_penalty(
+            history_points=history_points,
+            return_pct=return_pct,
+            volatility=volatility,
+            avg_abs_change=avg_abs_change,
+            trend_consistency=trend_consistency,
+        )
+        positive_return_bonus = ClobAnalyzer._positive_return_bonus(return_pct)
+        trend_bonus = ClobAnalyzer._trend_bonus(trend_consistency)
 
         raw_score = (
-            1.4 * history_term
-            + 0.02 * return_term
-            + 40.0 * vol_term
-            + 120.0 * change_term
+            1.6 * history_term
+            + 0.03 * capped_return
+            + 30.0 * vol_term
+            + 140.0 * change_term
             + midpoint_bonus
             + trade_bonus
             + price_bonus
+            + positive_return_bonus
+            + trend_bonus
             - midpoint_penalty
             - spread_penalty
+            - pump_penalty
         )
 
-        return raw_score, midpoint_penalty, spread_penalty
+        return (
+            raw_score,
+            midpoint_penalty,
+            spread_penalty,
+            pump_penalty,
+            positive_return_bonus,
+            trend_bonus,
+        )
 
     def analyze_token(
         self,
@@ -330,13 +420,22 @@ class ClobAnalyzer:
             history_points=history_points,
             volatility=metrics["volatility"],
             avg_abs_change=metrics["avg_abs_change"],
+            return_pct=metrics["return_pct"],
+            trend_consistency=metrics["trend_consistency"],
         )
 
         if not eligible:
             self.exclusion_reasons[eligibility_reason] += 1
             return None
 
-        score, midpoint_penalty, spread_penalty = self._score(
+        (
+            score,
+            midpoint_penalty,
+            spread_penalty,
+            pump_penalty,
+            positive_return_bonus,
+            trend_bonus,
+        ) = self._score(
             midpoint=midpoint,
             buy_price=buy_price,
             sell_price=sell_price,
@@ -346,6 +445,7 @@ class ClobAnalyzer:
             return_pct=metrics["return_pct"],
             volatility=metrics["volatility"],
             avg_abs_change=metrics["avg_abs_change"],
+            trend_consistency=metrics["trend_consistency"],
         )
 
         ranking_reason = {
@@ -359,8 +459,12 @@ class ClobAnalyzer:
             "return_pct": metrics["return_pct"],
             "volatility": metrics["volatility"],
             "avg_abs_change": metrics["avg_abs_change"],
+            "trend_consistency": metrics["trend_consistency"],
             "midpoint_penalty": midpoint_penalty,
             "spread_penalty": spread_penalty,
+            "pump_penalty": pump_penalty,
+            "positive_return_bonus": positive_return_bonus,
+            "trend_bonus": trend_bonus,
         }
 
         return TokenAnalysis(
@@ -384,6 +488,10 @@ class ClobAnalyzer:
             avg_abs_change=metrics["avg_abs_change"],
             min_price=metrics["min_price"],
             max_price=metrics["max_price"],
+            trend_consistency=metrics["trend_consistency"],
+            positive_return_bonus=positive_return_bonus,
+            trend_bonus=trend_bonus,
+            pump_penalty=pump_penalty,
             midpoint_penalty=midpoint_penalty,
             spread_penalty=spread_penalty,
             score=score,
@@ -470,23 +578,27 @@ class ClobAnalyzer:
         print(f"\nEncontradas {len(analyses)} análises de tokens elegíveis\n")
         for idx, item in enumerate(analyses[:limit], start=1):
             print(f"{idx:02d}. {item.parent_question} [{item.outcome}]")
-            print(f"    Event            : {item.parent_event_title}")
-            print(f"    URL              : {item.parent_url}")
-            print(f"    Token ID         : {item.token_id}")
-            print(f"    Midpoint         : {item.midpoint}")
-            print(f"    Best BUY price   : {item.buy_price}")
-            print(f"    Best SELL price  : {item.sell_price}")
-            print(f"    Spread           : {item.spread}")
-            print(f"    Last trade       : {item.last_trade_price} ({item.last_trade_side})")
-            print(f"    History points   : {item.history_points}")
-            print(f"    First / Last     : {item.first_price} -> {item.last_price}")
-            print(f"    Return %         : {item.return_pct}")
-            print(f"    Volatility       : {item.volatility}")
-            print(f"    Avg abs change   : {item.avg_abs_change}")
-            print(f"    Min / Max        : {item.min_price} / {item.max_price}")
-            print(f"    Midpoint penalty : {item.midpoint_penalty}")
-            print(f"    Spread penalty   : {item.spread_penalty}")
-            print(f"    Score            : {item.score:.4f}")
+            print(f"    Event                  : {item.parent_event_title}")
+            print(f"    URL                    : {item.parent_url}")
+            print(f"    Token ID               : {item.token_id}")
+            print(f"    Midpoint               : {item.midpoint}")
+            print(f"    Best BUY price         : {item.buy_price}")
+            print(f"    Best SELL price        : {item.sell_price}")
+            print(f"    Spread                 : {item.spread}")
+            print(f"    Last trade             : {item.last_trade_price} ({item.last_trade_side})")
+            print(f"    History points         : {item.history_points}")
+            print(f"    First / Last           : {item.first_price} -> {item.last_price}")
+            print(f"    Return %               : {item.return_pct}")
+            print(f"    Volatility             : {item.volatility}")
+            print(f"    Avg abs change         : {item.avg_abs_change}")
+            print(f"    Min / Max              : {item.min_price} / {item.max_price}")
+            print(f"    Trend consistency      : {item.trend_consistency}")
+            print(f"    Positive return bonus  : {item.positive_return_bonus}")
+            print(f"    Trend bonus            : {item.trend_bonus}")
+            print(f"    Pump penalty           : {item.pump_penalty}")
+            print(f"    Midpoint penalty       : {item.midpoint_penalty}")
+            print(f"    Spread penalty         : {item.spread_penalty}")
+            print(f"    Score                  : {item.score:.4f}")
             print("-" * 100)
 
 
@@ -498,7 +610,7 @@ if __name__ == "__main__":
             input_json=INPUT_JSON,
             interval="1d",
             fidelity=60,
-            top_n=None,  # mete um número se quiseres limitar
+            top_n=None,
         )
 
         analyzer.print_summary(analyses, limit=20)
