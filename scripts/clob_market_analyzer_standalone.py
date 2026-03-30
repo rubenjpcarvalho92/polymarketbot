@@ -278,10 +278,10 @@ class ClobAnalyzer:
         if return_pct is None:
             return False, "missing_return"
 
-        if return_pct <= 0:
+        if return_pct is not None and return_pct < -5 :
             return False, "not_buy_trending"
 
-        if trend_consistency is None or trend_consistency < 0.50:
+        if trend_consistency is None or trend_consistency < 0.35:
             return False, "weak_trend_consistency"
 
         if return_pct > 80:
