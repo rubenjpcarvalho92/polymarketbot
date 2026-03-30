@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,8 +40,11 @@ from strategies.rsi_vwap import RsiVwapStrategy
 
 LOGS_DIR = PROJECT_ROOT / "logs"
 TOKEN_ANALYSIS_JSON = PROJECT_ROOT / "token_analysis_results.json"
+GAMMA_FILTERED_JSON = PROJECT_ROOT / "gamma_scan_results_filtered.json"
+
 MIN_API_HISTORY_POINTS = 20
 API_HISTORY_FIDELITY = 5
+TOKEN_ANALYSIS_MAX_AGE_SECONDS = 300
 
 
 @dataclass
@@ -66,6 +71,49 @@ def get_strategies() -> dict:
 def get_public_clob_host(config: AppConfig) -> str:
     raw_host = getattr(config.polymarket, "host", None) or "https://clob.polymarket.com"
     return str(raw_host).rstrip("/")
+
+
+def is_file_stale(path: Path, max_age_seconds: int) -> bool:
+    if not path.exists():
+        return True
+    try:
+        age_seconds = time.time() - path.stat().st_mtime
+        return age_seconds > max_age_seconds
+    except Exception:
+        return True
+
+
+def ensure_token_analysis_exists(force_refresh: bool = False) -> None:
+    should_refresh = force_refresh or is_file_stale(
+        TOKEN_ANALYSIS_JSON,
+        max_age_seconds=TOKEN_ANALYSIS_MAX_AGE_SECONDS,
+    )
+
+    if not should_refresh:
+        return
+
+    print("Refreshing market scan files...")
+    print("-------------------------------")
+
+    python_exec = sys.executable
+
+    try:
+        subprocess.run(
+            [python_exec, "scripts/gamma_scanner_standalone.py"],
+            cwd=PROJECT_ROOT,
+            check=True,
+        )
+        subprocess.run(
+            [python_exec, "scripts/clob_market_analyzer_standalone.py"],
+            cwd=PROJECT_ROOT,
+            check=True,
+        )
+        print("Market scan refreshed successfully.")
+        print()
+    except subprocess.CalledProcessError as exc:
+        print(f"WARNING: failed to refresh market scan files: {exc}")
+        print("Continuing with existing files if available.")
+        print()
 
 
 def build_fake_history_from_orderbook(best_bid: float, best_ask: float) -> dict:
@@ -556,6 +604,8 @@ def main() -> None:
     print(f"Equity before cycle  : {position_state.current_balance}")
     print(f"Open exposure        : {position_state.open_exposure}")
     print()
+
+    ensure_token_analysis_exists()
 
     client = PolymarketClient(config.polymarket)
 
