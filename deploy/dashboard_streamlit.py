@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pandas as pd
@@ -11,6 +12,9 @@ LOGS_DIR = BASE_DIR / "logs"
 CYCLES_CSV = LOGS_DIR / "cycles.csv"
 TRADES_CSV = LOGS_DIR / "trades.csv"
 PORTFOLIO_CSV = LOGS_DIR / "portfolio.csv"
+
+TOKEN_ANALYSIS_JSON = BASE_DIR / "token_analysis_results.json"
+GAMMA_FILTERED_JSON = BASE_DIR / "gamma_scan_results_filtered.json"
 
 
 st.set_page_config(
@@ -32,11 +36,11 @@ def load_csv(path: Path) -> pd.DataFrame:
 
 def safe_sort_by_timestamp(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty or "timestamp" not in df.columns:
-        return pd.DataFrame()
+        return pd.DataFrame() if df is None else df
     try:
         return df.sort_values("timestamp")
     except Exception:
-        return pd.DataFrame()
+        return df
 
 
 def format_number(value: float | int | str | None, decimals: int = 4) -> str:
@@ -44,6 +48,140 @@ def format_number(value: float | int | str | None, decimals: int = 4) -> str:
         return f"{float(value):,.{decimals}f}"
     except Exception:
         return "-"
+
+
+def load_json(path: Path):
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def normalize_outcome(value) -> str:
+    if value is None:
+        return "-"
+    text = str(value).strip().upper()
+    if text in {"YES", "NO"}:
+        return text
+    return str(value)
+
+
+def build_token_metadata() -> dict[str, dict[str, str]]:
+    """
+    Retorna:
+    {
+        token_id: {
+            "market_name": "...",
+            "outcome": "YES" / "NO",
+            "display_name": "Market Name [YES]"
+        }
+    }
+    """
+    token_map: dict[str, dict[str, str]] = {}
+
+    # 1) Tentar primeiro token_analysis_results.json
+    analysis_data = load_json(TOKEN_ANALYSIS_JSON)
+    if isinstance(analysis_data, list):
+        for item in analysis_data:
+            if not isinstance(item, dict):
+                continue
+
+            token_id = str(item.get("token_id", "")).strip()
+            if not token_id:
+                continue
+
+            market_name = (
+                item.get("parent_question")
+                or item.get("parent_event_title")
+                or item.get("question")
+                or item.get("event_title")
+                or item.get("market_name")
+                or "Unknown Market"
+            )
+
+            outcome = normalize_outcome(item.get("outcome"))
+            display_name = f"{market_name} [{outcome}]"
+
+            token_map[token_id] = {
+                "market_name": str(market_name),
+                "outcome": str(outcome),
+                "display_name": display_name,
+            }
+
+    # 2) Fallback: tentar gamma_scan_results_filtered.json
+    if not token_map:
+        gamma_data = load_json(GAMMA_FILTERED_JSON)
+
+        if isinstance(gamma_data, list):
+            for item in gamma_data:
+                if not isinstance(item, dict):
+                    continue
+
+                # Alguns formatos possíveis
+                market_name = (
+                    item.get("question")
+                    or item.get("title")
+                    or item.get("event_title")
+                    or item.get("market_name")
+                    or "Unknown Market"
+                )
+
+                tokens = item.get("tokens", [])
+                if not isinstance(tokens, list):
+                    continue
+
+                for token in tokens:
+                    if not isinstance(token, dict):
+                        continue
+
+                    token_id = str(
+                        token.get("token_id")
+                        or token.get("id")
+                        or ""
+                    ).strip()
+
+                    if not token_id:
+                        continue
+
+                    outcome = normalize_outcome(
+                        token.get("outcome")
+                        or token.get("name")
+                        or token.get("side")
+                    )
+
+                    display_name = f"{market_name} [{outcome}]"
+
+                    token_map[token_id] = {
+                        "market_name": str(market_name),
+                        "outcome": str(outcome),
+                        "display_name": display_name,
+                    }
+
+    return token_map
+
+
+def enrich_with_token_metadata(df: pd.DataFrame, token_map: dict[str, dict[str, str]]) -> pd.DataFrame:
+    if df is None or df.empty or "token_id" not in df.columns:
+        return df
+
+    enriched = df.copy()
+    enriched["token_id"] = enriched["token_id"].astype(str)
+
+    enriched["market_name"] = enriched["token_id"].map(
+        lambda x: token_map.get(x, {}).get("market_name", "-")
+    )
+    enriched["outcome"] = enriched["token_id"].map(
+        lambda x: token_map.get(x, {}).get("outcome", "-")
+    )
+    enriched["token_display"] = enriched["token_id"].map(
+        lambda x: token_map.get(x, {}).get("display_name", x)
+    )
+
+    return enriched
 
 
 cycles_df = load_csv(CYCLES_CSV)
@@ -54,12 +192,18 @@ cycles_df = safe_sort_by_timestamp(cycles_df)
 trades_df = safe_sort_by_timestamp(trades_df)
 portfolio_df = safe_sort_by_timestamp(portfolio_df)
 
+token_map = build_token_metadata()
+
+cycles_df = enrich_with_token_metadata(cycles_df, token_map)
+trades_df = enrich_with_token_metadata(trades_df, token_map)
+
 st.title("Polymarket Bot Dashboard")
 
-col_a, col_b, col_c = st.columns(3)
+col_a, col_b, col_c, col_d = st.columns(4)
 col_a.write(f"**Cycles CSV:** {'✅' if not cycles_df.empty else '❌'}")
 col_b.write(f"**Trades CSV:** {'✅' if not trades_df.empty else '❌'}")
 col_c.write(f"**Portfolio CSV:** {'✅' if not portfolio_df.empty else '❌'}")
+col_d.write(f"**Token metadata:** {'✅' if len(token_map) > 0 else '❌'}")
 
 if portfolio_df.empty:
     st.warning("Ainda não há dados válidos em logs/portfolio.csv")
@@ -68,12 +212,27 @@ if portfolio_df.empty:
 
 latest_portfolio = portfolio_df.iloc[-1]
 
-token_options = ["Todos"]
+token_options = [{"label": "Todos", "value": "Todos"}]
 if not cycles_df.empty and "token_id" in cycles_df.columns:
-    token_values = [str(x) for x in cycles_df["token_id"].dropna().astype(str).unique().tolist()]
-    token_options.extend(sorted(token_values))
+    unique_tokens = cycles_df["token_id"].dropna().astype(str).unique().tolist()
 
-selected_token = st.selectbox("Token", token_options, index=0)
+    for token_id in sorted(unique_tokens):
+        label = token_map.get(token_id, {}).get("display_name", token_id)
+        token_options.append(
+            {
+                "label": label,
+                "value": token_id,
+            }
+        )
+
+selected_option = st.selectbox(
+    "Token",
+    options=token_options,
+    format_func=lambda x: x["label"],
+    index=0,
+)
+
+selected_token = selected_option["value"]
 
 if not cycles_df.empty and selected_token != "Todos" and "token_id" in cycles_df.columns:
     filtered_cycles = cycles_df[cycles_df["token_id"].astype(str) == selected_token].copy()
@@ -146,7 +305,11 @@ if not filtered_cycles.empty:
     c1.metric("Último Signal", str(latest_cycle.get("signal", "-")))
     c2.metric("Última Reason", str(latest_cycle.get("reason", "-")))
     c3.metric("Último Order Status", str(latest_cycle.get("order_status", "-")))
-    c4.metric("Último Token", str(latest_cycle.get("token_id", "-"))[:18] + "...")
+    c4.metric("Último Token", str(latest_cycle.get("token_display", "-")))
+
+    c5, c6 = st.columns(2)
+    c5.metric("Nome do mercado", str(latest_cycle.get("market_name", "-")))
+    c6.metric("Outcome", str(latest_cycle.get("outcome", "-")))
 
 tab1, tab2, tab3 = st.tabs(["Portfolio CSV", "Cycles CSV", "Trades CSV"])
 
@@ -165,6 +328,9 @@ with tab2:
             col
             for col in [
                 "timestamp",
+                "market_name",
+                "outcome",
+                "token_display",
                 "token_id",
                 "best_bid",
                 "best_ask",
@@ -202,6 +368,9 @@ with tab3:
             col
             for col in [
                 "timestamp",
+                "market_name",
+                "outcome",
+                "token_display",
                 "token_id",
                 "side",
                 "price",
@@ -228,3 +397,4 @@ with tab3:
         )
 
 st.caption(f"Logs lidos de: {LOGS_DIR}")
+st.caption(f"Metadata procurada em: {TOKEN_ANALYSIS_JSON} e {GAMMA_FILTERED_JSON}")
