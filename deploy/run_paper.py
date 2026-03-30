@@ -605,7 +605,7 @@ def main() -> None:
     print(f"Open exposure        : {position_state.open_exposure}")
     print()
 
-    ensure_token_analysis_exists()
+    ensure_token_analysis_exists(force_refresh=True)
 
     client = PolymarketClient(config.polymarket)
 
@@ -646,6 +646,9 @@ def main() -> None:
             print("Candidate evaluation")
             print("--------------------")
 
+            selected_evaluation = None
+            first_eligible_evaluation = None
+
             for idx, candidate in enumerate(candidates, start=1):
                 passes_candidate_filter, candidate_reason = basic_buy_candidate_filter(candidate)
 
@@ -672,6 +675,9 @@ def main() -> None:
                     position_sizer=position_sizer,
                     position_state=position_state,
                 )
+
+                if first_eligible_evaluation is None:
+                    first_eligible_evaluation = evaluation
 
                 result = evaluation["result"]
                 book = evaluation["book"]
@@ -705,13 +711,19 @@ def main() -> None:
                     break
 
             if selected_evaluation is None:
-                print("Nenhum candidato BUY válido encontrado neste ciclo.")
-                print()
-                print("Portfolio")
-                print("---------")
-                for key, value in portfolio_snapshot_before.items():
-                    print(f"{key}: {value}")
-                return
+                if first_eligible_evaluation is not None:
+                    selected_evaluation = first_eligible_evaluation
+                    print("Nenhum candidato deu sinal BUY imediato.")
+                    print("A usar o primeiro candidato elegível da lista como fallback.")
+                    print()
+                else:
+                    print("Nenhum candidato elegível encontrado neste ciclo.")
+                    print()
+                    print("Portfolio")
+                    print("---------")
+                    for key, value in portfolio_snapshot_before.items():
+                        print(f"{key}: {value}")
+                    return
 
             selected_token_id = selected_evaluation["token_id"]
             selected_market_name = selected_evaluation["market_name"]
