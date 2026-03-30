@@ -1,4 +1,3 @@
-# scripts/clob_market_analyzer_standalone.py
 from __future__ import annotations
 
 import json
@@ -29,6 +28,10 @@ class TokenAnalysis:
     token_id: str
 
     midpoint: Optional[float]
+    buy_price: Optional[float]   # best ask: price to buy
+    sell_price: Optional[float]  # best bid: price to sell
+    spread: Optional[float]
+
     last_trade_price: Optional[float]
     last_trade_side: Optional[str]
 
@@ -41,6 +44,8 @@ class TokenAnalysis:
     min_price: Optional[float]
     max_price: Optional[float]
 
+    midpoint_penalty: float
+    spread_penalty: float
     score: float
     ranking_reason: Dict[str, Any]
 
@@ -53,7 +58,7 @@ class ClobAnalyzer:
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "clob-market-analyzer-standalone/1.0",
+                "User-Agent": "clob-market-analyzer-standalone/2.0",
             }
         )
 
@@ -74,17 +79,20 @@ class ClobAnalyzer:
 
     def get_midpoint(self, token_id: str) -> Optional[float]:
         data = self._get("/midpoint", {"token_id": token_id})
-        # docs show {"mid_price": "0.45"} on REST
-        mid = data.get("mid_price")
-        if mid is None:
-            mid = data.get("mid")
-        return self._to_float(mid)
+        # API/docs sometimes show mid or mid_price depending on surface
+        return self._to_float(data.get("mid")) or self._to_float(data.get("mid_price"))
+
+    def get_price(self, token_id: str, side: str) -> Optional[float]:
+        data = self._get("/price", {"token_id": token_id, "side": side})
+        return self._to_float(data.get("price"))
+
+    def get_spread(self, token_id: str) -> Optional[float]:
+        data = self._get("/spread", {"token_id": token_id})
+        return self._to_float(data.get("spread"))
 
     def get_last_trade_price(self, token_id: str) -> Tuple[Optional[float], Optional[str]]:
         data = self._get("/last-trade-price", {"token_id": token_id})
-        price = self._to_float(data.get("price"))
-        side = data.get("side")
-        return price, side
+        return self._to_float(data.get("price")), data.get("side")
 
     def get_prices_history(
         self,
@@ -106,17 +114,14 @@ class ClobAnalyzer:
 
         data = self._get("/prices-history", params)
         history = data.get("history", [])
-        if not isinstance(history, list):
-            return []
-        return history
+        return history if isinstance(history, list) else []
 
     @staticmethod
     def _extract_prices(history: List[Dict[str, Any]]) -> List[float]:
         prices: List[float] = []
         for row in history:
-            p = row.get("p")
             try:
-                prices.append(float(p))
+                prices.append(float(row.get("p")))
             except (TypeError, ValueError):
                 continue
         return prices
@@ -158,31 +163,82 @@ class ClobAnalyzer:
         }
 
     @staticmethod
+    def _midpoint_extreme_penalty(midpoint: Optional[float]) -> float:
+        """
+        Penaliza contratos muito perto de 0 ou 1.
+        Zona saudável ~ [0.10, 0.90].
+        """
+        if midpoint is None:
+            return 1.5
+
+        if midpoint < 0.03 or midpoint > 0.97:
+            return 4.0
+        if midpoint < 0.05 or midpoint > 0.95:
+            return 2.5
+        if midpoint < 0.10 or midpoint > 0.90:
+            return 1.0
+        return 0.0
+
+    @staticmethod
+    def _spread_penalty(spread: Optional[float]) -> float:
+        """
+        Tighter spread = melhor mercado.
+        """
+        if spread is None:
+            return 2.0
+        if spread >= 0.10:
+            return 4.0
+        if spread >= 0.05:
+            return 2.0
+        if spread >= 0.02:
+            return 1.0
+        return 0.0
+
+    @staticmethod
     def _score(
         midpoint: Optional[float],
+        buy_price: Optional[float],
+        sell_price: Optional[float],
+        spread: Optional[float],
         last_trade_price: Optional[float],
         history_points: int,
         return_pct: Optional[float],
         volatility: Optional[float],
         avg_abs_change: Optional[float],
-    ) -> float:
-        # Score simples para triagem inicial
+    ) -> Tuple[float, float, float]:
+        """
+        Score mais orientado a trading real:
+        - favorece histórico suficiente
+        - favorece movimento absoluto e alguma volatilidade
+        - penaliza spread largo
+        - penaliza contratos muito perto de 0 ou 1
+        - reduz peso de return_pct puro
+        """
         history_term = math.log1p(max(history_points, 0))
-        return_term = abs(return_pct) if return_pct is not None else 0.0
-        vol_term = volatility if volatility is not None else 0.0
-        change_term = avg_abs_change if avg_abs_change is not None else 0.0
+        return_term = min(abs(return_pct), 25.0) if return_pct is not None else 0.0
+        vol_term = volatility or 0.0
+        change_term = avg_abs_change or 0.0
 
         midpoint_bonus = 1.0 if midpoint is not None else 0.0
         trade_bonus = 1.0 if last_trade_price is not None else 0.0
+        price_bonus = 1.0 if (buy_price is not None and sell_price is not None) else 0.0
 
-        return (
-            1.2 * history_term
-            + 0.08 * return_term
-            + 8.0 * vol_term
-            + 20.0 * change_term
+        midpoint_penalty = ClobAnalyzer._midpoint_extreme_penalty(midpoint)
+        spread_penalty = ClobAnalyzer._spread_penalty(spread)
+
+        raw_score = (
+            1.4 * history_term
+            + 0.03 * return_term
+            + 20.0 * vol_term
+            + 60.0 * change_term
             + midpoint_bonus
             + trade_bonus
+            + price_bonus
+            - midpoint_penalty
+            - spread_penalty
         )
+
+        return raw_score, midpoint_penalty, spread_penalty
 
     def analyze_token(
         self,
@@ -196,6 +252,9 @@ class ClobAnalyzer:
         fidelity: int,
     ) -> TokenAnalysis:
         midpoint = None
+        buy_price = None
+        sell_price = None
+        spread = None
         last_trade_price = None
         last_trade_side = None
         history: List[Dict[str, Any]] = []
@@ -204,6 +263,27 @@ class ClobAnalyzer:
             midpoint = self.get_midpoint(token_id)
         except Exception:
             midpoint = None
+
+        time.sleep(self.sleep_between_calls)
+
+        try:
+            buy_price = self.get_price(token_id, "BUY")
+        except Exception:
+            buy_price = None
+
+        time.sleep(self.sleep_between_calls)
+
+        try:
+            sell_price = self.get_price(token_id, "SELL")
+        except Exception:
+            sell_price = None
+
+        time.sleep(self.sleep_between_calls)
+
+        try:
+            spread = self.get_spread(token_id)
+        except Exception:
+            spread = None
 
         time.sleep(self.sleep_between_calls)
 
@@ -225,11 +305,13 @@ class ClobAnalyzer:
 
         prices = self._extract_prices(history)
         metrics = self._compute_metrics(prices)
-
         history_points = len(prices)
 
-        score = self._score(
+        score, midpoint_penalty, spread_penalty = self._score(
             midpoint=midpoint,
+            buy_price=buy_price,
+            sell_price=sell_price,
+            spread=spread,
             last_trade_price=last_trade_price,
             history_points=history_points,
             return_pct=metrics["return_pct"],
@@ -240,10 +322,15 @@ class ClobAnalyzer:
         ranking_reason = {
             "history_points": history_points,
             "midpoint": midpoint,
+            "buy_price": buy_price,
+            "sell_price": sell_price,
+            "spread": spread,
             "last_trade_price": last_trade_price,
             "return_pct": metrics["return_pct"],
             "volatility": metrics["volatility"],
             "avg_abs_change": metrics["avg_abs_change"],
+            "midpoint_penalty": midpoint_penalty,
+            "spread_penalty": spread_penalty,
         }
 
         return TokenAnalysis(
@@ -254,6 +341,9 @@ class ClobAnalyzer:
             outcome=outcome,
             token_id=token_id,
             midpoint=midpoint,
+            buy_price=buy_price,
+            sell_price=sell_price,
+            spread=spread,
             last_trade_price=last_trade_price,
             last_trade_side=last_trade_side,
             history_points=history_points,
@@ -264,6 +354,8 @@ class ClobAnalyzer:
             avg_abs_change=metrics["avg_abs_change"],
             min_price=metrics["min_price"],
             max_price=metrics["max_price"],
+            midpoint_penalty=midpoint_penalty,
+            spread_penalty=spread_penalty,
             score=score,
             ranking_reason=ranking_reason,
         )
@@ -286,7 +378,6 @@ class ClobAnalyzer:
             raise ValueError("O JSON de entrada deve ser uma lista de mercados.")
 
         analyses: List[TokenAnalysis] = []
-
         selected_markets = markets[:top_n] if top_n is not None else markets
 
         for market in selected_markets:
@@ -299,30 +390,32 @@ class ClobAnalyzer:
             no_token_id = market.get("no_token_id")
 
             if yes_token_id:
-                analysis_yes = self.analyze_token(
-                    token_id=str(yes_token_id),
-                    outcome="YES",
-                    parent_market_id=parent_market_id,
-                    parent_question=parent_question,
-                    parent_event_title=parent_event_title,
-                    parent_url=parent_url,
-                    interval=interval,
-                    fidelity=fidelity,
+                analyses.append(
+                    self.analyze_token(
+                        token_id=str(yes_token_id),
+                        outcome="YES",
+                        parent_market_id=parent_market_id,
+                        parent_question=parent_question,
+                        parent_event_title=parent_event_title,
+                        parent_url=parent_url,
+                        interval=interval,
+                        fidelity=fidelity,
+                    )
                 )
-                analyses.append(analysis_yes)
 
             if no_token_id:
-                analysis_no = self.analyze_token(
-                    token_id=str(no_token_id),
-                    outcome="NO",
-                    parent_market_id=parent_market_id,
-                    parent_question=parent_question,
-                    parent_event_title=parent_event_title,
-                    parent_url=parent_url,
-                    interval=interval,
-                    fidelity=fidelity,
+                analyses.append(
+                    self.analyze_token(
+                        token_id=str(no_token_id),
+                        outcome="NO",
+                        parent_market_id=parent_market_id,
+                        parent_question=parent_question,
+                        parent_event_title=parent_event_title,
+                        parent_url=parent_url,
+                        interval=interval,
+                        fidelity=fidelity,
+                    )
                 )
-                analyses.append(analysis_no)
 
         analyses.sort(key=lambda x: x.score, reverse=True)
         return analyses
@@ -338,18 +431,23 @@ class ClobAnalyzer:
         print(f"\nEncontradas {len(analyses)} análises de tokens\n")
         for idx, item in enumerate(analyses[:limit], start=1):
             print(f"{idx:02d}. {item.parent_question} [{item.outcome}]")
-            print(f"    Event          : {item.parent_event_title}")
-            print(f"    URL            : {item.parent_url}")
-            print(f"    Token ID       : {item.token_id}")
-            print(f"    Midpoint       : {item.midpoint}")
-            print(f"    Last trade     : {item.last_trade_price} ({item.last_trade_side})")
-            print(f"    History points : {item.history_points}")
-            print(f"    First / Last   : {item.first_price} -> {item.last_price}")
-            print(f"    Return %       : {item.return_pct}")
-            print(f"    Volatility     : {item.volatility}")
-            print(f"    Avg abs change : {item.avg_abs_change}")
-            print(f"    Min / Max      : {item.min_price} / {item.max_price}")
-            print(f"    Score          : {item.score:.4f}")
+            print(f"    Event            : {item.parent_event_title}")
+            print(f"    URL              : {item.parent_url}")
+            print(f"    Token ID         : {item.token_id}")
+            print(f"    Midpoint         : {item.midpoint}")
+            print(f"    Best BUY price   : {item.buy_price}")
+            print(f"    Best SELL price  : {item.sell_price}")
+            print(f"    Spread           : {item.spread}")
+            print(f"    Last trade       : {item.last_trade_price} ({item.last_trade_side})")
+            print(f"    History points   : {item.history_points}")
+            print(f"    First / Last     : {item.first_price} -> {item.last_price}")
+            print(f"    Return %         : {item.return_pct}")
+            print(f"    Volatility       : {item.volatility}")
+            print(f"    Avg abs change   : {item.avg_abs_change}")
+            print(f"    Min / Max        : {item.min_price} / {item.max_price}")
+            print(f"    Midpoint penalty : {item.midpoint_penalty}")
+            print(f"    Spread penalty   : {item.spread_penalty}")
+            print(f"    Score            : {item.score:.4f}")
             print("-" * 100)
 
 
@@ -361,7 +459,7 @@ if __name__ == "__main__":
             input_json=INPUT_JSON,
             interval="1d",
             fidelity=60,
-            top_n=20,  # None para analisar tudo
+            top_n=20,  # mete None para analisar tudo
         )
 
         analyzer.print_summary(analyses, limit=20)
