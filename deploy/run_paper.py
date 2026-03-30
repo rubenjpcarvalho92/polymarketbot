@@ -38,6 +38,7 @@ from strategies.rsi_vwap import RsiVwapStrategy
 
 LOGS_DIR = PROJECT_ROOT / "logs"
 TOKEN_ANALYSIS_JSON = PROJECT_ROOT / "token_analysis_results.json"
+MIN_API_HISTORY_POINTS = 20
 
 
 @dataclass
@@ -206,7 +207,7 @@ def fetch_prices_history_from_api(
 
 
 def build_market_data_from_api_prices(prices: list[float]) -> Optional[dict]:
-    if len(prices) < 35:
+    if len(prices) < MIN_API_HISTORY_POINTS:
         return None
 
     closes: list[float] = []
@@ -520,6 +521,7 @@ def evaluate_token(
         "history_path": history_path,
         "history_source": history_source,
         "api_history_points": len(api_prices),
+        "api_history_enough": len(api_prices) >= MIN_API_HISTORY_POINTS,
         "calculated_order_size": calculated_order_size,
         "result": result,
         "midpoint": midpoint,
@@ -633,6 +635,7 @@ def main() -> None:
                 print(f"    Last trade side  : {last_trade['side']}")
                 print(f"    History source   : {evaluation['history_source']}")
                 print(f"    API hist points  : {evaluation['api_history_points']}")
+                print(f"    API hist enough  : {evaluation['api_history_enough']}")
                 print(f"    History file     : {evaluation['history_path'].name}")
                 print(f"    Calc order size  : {evaluation['calculated_order_size']}")
 
@@ -702,6 +705,8 @@ def main() -> None:
         print(
             f"History source      : {final_evaluation['history_source']}\n"
             f"API hist points     : {final_evaluation['api_history_points']}\n"
+            f"API hist enough     : {final_evaluation['api_history_enough']}\n"
+            f"Min API hist needed : {MIN_API_HISTORY_POINTS}\n"
             f"History file        : {final_evaluation['history_path'].name}\n"
             f"History window      : 24h"
         )
