@@ -1,4 +1,3 @@
-# scripts/gamma_scanner_standalone.py
 from __future__ import annotations
 
 import json
@@ -6,6 +5,7 @@ import math
 import sys
 import time
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -43,6 +43,7 @@ class MarketRow:
     end_date_iso: Optional[str]
 
     score: float
+    ranking_reason: Dict[str, Any]
 
 
 class GammaScanner:
@@ -52,7 +53,7 @@ class GammaScanner:
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "gamma-scanner-standalone/1.1",
+                "User-Agent": "gamma-scanner-standalone/2.0",
             }
         )
 
@@ -104,7 +105,30 @@ class GammaScanner:
         return {}
 
     @staticmethod
-    def _score(liquidity: float, volume: float, volume_24hr: float, order_book_ok: bool, active_ok: bool) -> float:
+    def _parse_iso_datetime(date_str: Optional[str]) -> Optional[datetime]:
+        if not date_str:
+            return None
+        try:
+            return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    def _is_future_market(self, end_date_iso: Optional[str]) -> bool:
+        if not end_date_iso:
+            return True
+        dt = self._parse_iso_datetime(end_date_iso)
+        if dt is None:
+            return True
+        return dt > datetime.now(timezone.utc)
+
+    @staticmethod
+    def _score(
+        liquidity: float,
+        volume: float,
+        volume_24hr: float,
+        order_book_ok: bool,
+        active_ok: bool,
+    ) -> float:
         return (
             1.8 * math.log1p(max(liquidity, 0.0))
             + 1.0 * math.log1p(max(volume, 0.0))
@@ -150,20 +174,10 @@ class GammaScanner:
 
         return events
 
-    def scan(
+    def flatten_events_to_markets(
         self,
-        page_size: int = 100,
-        max_pages: int = 2,
-        min_liquidity: float = 1000.0,
-        min_volume_24hr: float = 500.0,
-        require_order_book: bool = True,
-        top_n: int = 20,
+        events: List[Dict[str, Any]],
     ) -> List[MarketRow]:
-        events = self.fetch_active_events(
-            page_size=page_size,
-            max_pages=max_pages,
-        )
-
         results: List[MarketRow] = []
 
         for event in events:
@@ -176,6 +190,9 @@ class GammaScanner:
                 continue
 
             for market in markets:
+                active = self._to_bool(self._first_non_empty(market, ["active"]))
+                closed = self._to_bool(self._first_non_empty(market, ["closed"]))
+                archived = self._to_bool(self._first_non_empty(market, ["archived"]))
                 enable_order_book = self._to_bool(
                     self._first_non_empty(
                         market,
@@ -183,26 +200,25 @@ class GammaScanner:
                     )
                 )
 
-                if require_order_book and enable_order_book is False:
-                    continue
-
-                active = self._to_bool(self._first_non_empty(market, ["active"]))
-                closed = self._to_bool(self._first_non_empty(market, ["closed"]))
-                archived = self._to_bool(self._first_non_empty(market, ["archived"]))
-
-                if closed is True or archived is True or active is False:
-                    continue
-
-                liquidity = self._to_float(self._first_non_empty(market, ["liquidity", "liquidityNum", "liquidityClob"]))
-                volume = self._to_float(self._first_non_empty(market, ["volume", "volumeNum", "volumeClob"]))
+                liquidity = self._to_float(
+                    self._first_non_empty(market, ["liquidity", "liquidityNum", "liquidityClob"])
+                )
+                volume = self._to_float(
+                    self._first_non_empty(market, ["volume", "volumeNum", "volumeClob"])
+                )
                 volume_24hr = self._to_float(
-                    self._first_non_empty(market, ["volume24hr", "volume_24hr", "oneDayVolume", "one_day_volume", "volume24hrClob"])
+                    self._first_non_empty(
+                        market,
+                        ["volume24hr", "volume_24hr", "oneDayVolume", "one_day_volume", "volume24hrClob"],
+                    )
                 )
 
-                if liquidity < min_liquidity:
-                    continue
-                if volume_24hr < min_volume_24hr:
-                    continue
+                start_date_iso = self._first_non_empty(
+                    market, ["startDate", "start_date", "start_date_iso", "startDateIso"]
+                )
+                end_date_iso = self._first_non_empty(
+                    market, ["endDate", "end_date", "end_date_iso", "endDateIso"]
+                )
 
                 yes_token_id = None
                 no_token_id = None
@@ -221,15 +237,14 @@ class GammaScanner:
                         try:
                             yes_price = float(yes_token["price"])
                         except (TypeError, ValueError):
-                            pass
+                            yes_price = None
 
                     if no_token.get("price") is not None:
                         try:
                             no_price = float(no_token["price"])
                         except (TypeError, ValueError):
-                            pass
+                            no_price = None
 
-                # fallback: alguns payloads trazem clobTokenIds mas não trazem tokens[]
                 if (not yes_token_id or not no_token_id) and market.get("clobTokenIds"):
                     raw = market.get("clobTokenIds")
                     try:
@@ -241,6 +256,8 @@ class GammaScanner:
                         pass
 
                 market_slug = self._first_non_empty(market, ["slug"])
+                question = self._first_non_empty(market, ["question", "title", "name"])
+
                 score = self._score(
                     liquidity=liquidity,
                     volume=volume,
@@ -248,6 +265,14 @@ class GammaScanner:
                     order_book_ok=(enable_order_book is not False),
                     active_ok=(active is not False),
                 )
+
+                ranking_reason = {
+                    "liquidity": liquidity,
+                    "volume": volume,
+                    "volume_24hr": volume_24hr,
+                    "enable_order_book": enable_order_book,
+                    "active": active,
+                }
 
                 results.append(
                     MarketRow(
@@ -258,7 +283,7 @@ class GammaScanner:
                         if self._first_non_empty(market, ["id", "market_id"]) is not None
                         else None,
                         market_slug=market_slug,
-                        question=self._first_non_empty(market, ["question", "title", "name"]),
+                        question=question,
                         url=f"https://polymarket.com/market/{market_slug}" if market_slug else None,
                         active=active,
                         closed=closed,
@@ -271,18 +296,97 @@ class GammaScanner:
                         no_token_id=str(no_token_id) if no_token_id is not None else None,
                         yes_price=yes_price,
                         no_price=no_price,
-                        start_date_iso=self._first_non_empty(market, ["startDate", "start_date", "start_date_iso", "startDateIso"]),
-                        end_date_iso=self._first_non_empty(market, ["endDate", "end_date", "end_date_iso", "endDateIso"]),
+                        start_date_iso=start_date_iso,
+                        end_date_iso=end_date_iso,
                         score=score,
+                        ranking_reason=ranking_reason,
                     )
                 )
 
-        results.sort(key=lambda x: x.score, reverse=True)
-        return results[:top_n]
+        return results
+
+    def filter_markets(
+        self,
+        markets: List[MarketRow],
+        min_liquidity: float = 1000.0,
+        min_volume_24hr: float = 500.0,
+        require_order_book: bool = True,
+        require_yes_no_tokens: bool = True,
+        require_future_end_date: bool = True,
+        exclude_keywords: Optional[List[str]] = None,
+    ) -> List[MarketRow]:
+        exclude_keywords = [k.lower() for k in (exclude_keywords or [])]
+        filtered: List[MarketRow] = []
+
+        for market in markets:
+            if market.closed is True:
+                continue
+            if market.archived is True:
+                continue
+            if market.active is False:
+                continue
+
+            if require_order_book and market.enable_order_book is False:
+                continue
+
+            if market.liquidity < min_liquidity:
+                continue
+
+            if market.volume_24hr < min_volume_24hr:
+                continue
+
+            if require_yes_no_tokens and (not market.yes_token_id or not market.no_token_id):
+                continue
+
+            if require_future_end_date and not self._is_future_market(market.end_date_iso):
+                continue
+
+            text = f"{market.event_title or ''} {market.question or ''}".lower()
+            if any(keyword in text for keyword in exclude_keywords):
+                continue
+
+            filtered.append(market)
+
+        filtered.sort(key=lambda x: x.score, reverse=True)
+        return filtered
+
+    def scan(
+        self,
+        page_size: int = 100,
+        max_pages: int = 2,
+        min_liquidity: float = 1000.0,
+        min_volume_24hr: float = 500.0,
+        require_order_book: bool = True,
+        require_yes_no_tokens: bool = True,
+        require_future_end_date: bool = True,
+        exclude_keywords: Optional[List[str]] = None,
+        top_n: int = 15,
+    ) -> Dict[str, List[MarketRow]]:
+        events = self.fetch_active_events(
+            page_size=page_size,
+            max_pages=max_pages,
+        )
+
+        raw_markets = self.flatten_events_to_markets(events)
+
+        filtered_markets = self.filter_markets(
+            markets=raw_markets,
+            min_liquidity=min_liquidity,
+            min_volume_24hr=min_volume_24hr,
+            require_order_book=require_order_book,
+            require_yes_no_tokens=require_yes_no_tokens,
+            require_future_end_date=require_future_end_date,
+            exclude_keywords=exclude_keywords,
+        )
+
+        return {
+            "raw": raw_markets,
+            "filtered": filtered_markets[:top_n],
+        }
 
 
-def print_markets(markets: List[MarketRow]) -> None:
-    print(f"\nEncontrados {len(markets)} mercados\n")
+def print_markets(markets: List[MarketRow], title: str) -> None:
+    print(f"\n{title}: {len(markets)} mercados\n")
     for i, m in enumerate(markets, start=1):
         print(f"{i:02d}. {m.question}")
         print(f"    Event        : {m.event_title}")
@@ -295,31 +399,43 @@ def print_markets(markets: List[MarketRow]) -> None:
         print(f"    Liquidity    : {m.liquidity}")
         print(f"    Volume       : {m.volume}")
         print(f"    Volume 24h   : {m.volume_24hr}")
+        print(f"    End date     : {m.end_date_iso}")
         print(f"    Score        : {m.score:.2f}")
+        print(f"    Reason       : {m.ranking_reason}")
         print("-" * 100)
 
 
-def save_json(markets: List[MarketRow], filename: str = "gamma_scan_results.json") -> None:
+def save_json(markets: List[MarketRow], filename: str) -> None:
     with open(filename, "w", encoding="utf-8") as f:
         json.dump([asdict(m) for m in markets], f, ensure_ascii=False, indent=2)
-    print(f"\nJSON gravado em: {filename}")
+    print(f"JSON gravado em: {filename}")
 
 
 if __name__ == "__main__":
     try:
         scanner = GammaScanner()
 
-        markets = scanner.scan(
+        result = scanner.scan(
             page_size=100,
-            max_pages=2,
+            max_pages=10,
             min_liquidity=1000.0,
             min_volume_24hr=500.0,
             require_order_book=True,
-            top_n=15,
+            require_yes_no_tokens=True,
+            require_future_end_date=True,
+            exclude_keywords=[
+                "2028 presidential nomination",
+                "2028 us presidential election",
+            ],
+            top_n=100,
         )
 
-        print_markets(markets)
-        save_json(markets)
+        raw_markets = result["raw"]
+        filtered_markets = result["filtered"]
+
+        print_markets(filtered_markets, "Encontrados")
+        save_json(raw_markets, "gamma_scan_results_raw.json")
+        save_json(filtered_markets, "gamma_scan_results_filtered.json")
 
     except requests.HTTPError as e:
         print(f"Erro HTTP: {e}", file=sys.stderr)
