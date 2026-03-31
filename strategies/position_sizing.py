@@ -23,7 +23,7 @@ class PositionSizingConfig:
     max_order_size: float = 1000.0
     max_exposure_pct: float = 15.0
 
-    fixed_percent: float = 2.0
+    fixed_percent: float = 5.0
     fixed_amount: float = 10.0
 
     kelly_win_rate: float = 0.55

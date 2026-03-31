@@ -36,6 +36,10 @@ class Trader:
         self.risk_manager = risk_manager or RiskManager()
         self.state = TraderState()
 
+        # Proteção global de lucro
+        self.take_profit_price = 0.95
+        self.take_profit_pct = 0.25
+
     def process_market(
         self,
         strategy_name: str,
@@ -51,14 +55,20 @@ class Trader:
         strategy = self.strategies[strategy_name]
         result = strategy.evaluate(context)
 
+        current_position = self.state.positions.get(context.market_id)
+
+        forced_exit = self._apply_profit_protection(
+            current_position=current_position,
+            best_bid=best_bid,
+            best_ask=best_ask,
+        )
+        if forced_exit is not None:
+            result = forced_exit
+
         if result.signal == Signal.HOLD:
             return result
 
-        current_position = self.state.positions.get(context.market_id)
-
-        # ------------------------------------------------------------
         # SELL = FECHAR TOTALMENTE A POSIÇÃO ATUAL
-        # ------------------------------------------------------------
         if result.signal == Signal.SELL and current_position is not None and current_position.size > 0:
             close_side = current_position.side
             close_size = current_position.size
@@ -106,9 +116,7 @@ class Trader:
                 },
             )
 
-        # ------------------------------------------------------------
-        # SEM POSIÇÃO PARA FECHAR -> NÃO FAZ SENTIDO VENDER
-        # ------------------------------------------------------------
+        # SEM POSIÇÃO PARA FECHAR
         if result.signal == Signal.SELL and current_position is None:
             return StrategyResult(
                 signal=Signal.HOLD,
@@ -116,9 +124,7 @@ class Trader:
                 metadata={**result.metadata},
             )
 
-        # ------------------------------------------------------------
         # ENTRADA NORMAL
-        # ------------------------------------------------------------
         side_value = result.metadata.get("side")
         if side_value not in {"YES", "NO"}:
             return StrategyResult(signal=Signal.HOLD, reason="missing_side_metadata")
@@ -198,7 +204,6 @@ class Trader:
         return 0.50
 
     def _compute_limit_price_for_exit(self, side: OrderSide, best_bid: float, best_ask: float) -> float:
-        # Para fechar posição, tenta usar o lado mais executável.
         if side == OrderSide.YES:
             if best_bid > 0:
                 return best_bid
@@ -207,6 +212,58 @@ class Trader:
         if best_ask > 0:
             return best_ask
         return 0.50
+
+    def _get_exit_mark_price(self, side: OrderSide, best_bid: float, best_ask: float) -> float:
+        if side == OrderSide.YES:
+            return best_bid if best_bid > 0 else 0.0
+        return best_ask if best_ask > 0 else 0.0
+
+    def _apply_profit_protection(
+        self,
+        current_position: Position | None,
+        best_bid: float,
+        best_ask: float,
+    ) -> StrategyResult | None:
+        if current_position is None or current_position.size <= 0:
+            return None
+
+        current_exit_price = self._get_exit_mark_price(
+            side=current_position.side,
+            best_bid=best_bid,
+            best_ask=best_ask,
+        )
+        entry_price = current_position.average_price
+
+        if current_exit_price <= 0 or entry_price <= 0:
+            return None
+
+        pnl_pct = (current_exit_price - entry_price) / entry_price
+
+        if current_exit_price >= self.take_profit_price:
+            return StrategyResult(
+                signal=Signal.SELL,
+                reason="take_profit_extreme_price",
+                metadata={
+                    "side": current_position.side.value,
+                    "entry_price": entry_price,
+                    "current_exit_price": current_exit_price,
+                    "pnl_pct": pnl_pct,
+                },
+            )
+
+        if pnl_pct >= self.take_profit_pct:
+            return StrategyResult(
+                signal=Signal.SELL,
+                reason="take_profit_pct",
+                metadata={
+                    "side": current_position.side.value,
+                    "entry_price": entry_price,
+                    "current_exit_price": current_exit_price,
+                    "pnl_pct": pnl_pct,
+                },
+            )
+
+        return None
 
     def _update_position_from_fill(self, order) -> None:
         self.state.positions[order.market_id] = Position(
