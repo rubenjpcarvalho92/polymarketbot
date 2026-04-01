@@ -27,8 +27,9 @@ BTC_KEYWORDS = [
     "all time high",
 ]
 
-NEW_ENTRY_MIN_DAYS = 15.0
-NEW_ENTRY_MAX_DAYS = 60.0
+PREFERRED_MIN_DAYS = 15.0
+PREFERRED_MAX_DAYS = 60.0
+MAX_ALLOWED_DAYS = 90.0
 FORCE_EXIT_DAYS = 7.0
 
 
@@ -49,8 +50,8 @@ class TokenAnalysis:
     btc_relevance_score: float
 
     midpoint: Optional[float]
-    buy_price: Optional[float]   # best ask: price to buy
-    sell_price: Optional[float]  # best bid: price to sell
+    buy_price: Optional[float]
+    sell_price: Optional[float]
     spread: Optional[float]
 
     last_trade_price: Optional[float]
@@ -86,7 +87,7 @@ class ClobAnalyzer:
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "clob-market-analyzer-standalone/6.0-btc-focused",
+                "User-Agent": "clob-market-analyzer-standalone/7.0-btc-focused",
             }
         )
         self.exclusion_reasons: Counter[str] = Counter()
@@ -157,13 +158,15 @@ class ClobAnalyzer:
     @staticmethod
     def _compute_time_penalty(days_to_resolution: Optional[float]) -> float:
         if days_to_resolution is None:
-            return 3.0
+            return 2.5
         if days_to_resolution <= FORCE_EXIT_DAYS:
             return 3.0
-        if days_to_resolution < NEW_ENTRY_MIN_DAYS:
+        if days_to_resolution < PREFERRED_MIN_DAYS:
+            return 0.8
+        if days_to_resolution > PREFERRED_MAX_DAYS and days_to_resolution <= MAX_ALLOWED_DAYS:
+            return 0.6
+        if days_to_resolution > MAX_ALLOWED_DAYS:
             return 2.0
-        if days_to_resolution > NEW_ENTRY_MAX_DAYS:
-            return 1.5
         return 0.0
 
     @staticmethod
@@ -269,7 +272,6 @@ class ClobAnalyzer:
     def _midpoint_extreme_penalty(midpoint: Optional[float]) -> float:
         if midpoint is None:
             return 1.5
-
         if midpoint < 0.10 or midpoint > 0.90:
             return 3.0
         if midpoint < 0.15 or midpoint > 0.85:
@@ -359,11 +361,8 @@ class ClobAnalyzer:
         if days_to_resolution <= FORCE_EXIT_DAYS:
             return False, "too_close_to_resolution"
 
-        if days_to_resolution < NEW_ENTRY_MIN_DAYS:
-            return False, "below_entry_window"
-
-        if days_to_resolution > NEW_ENTRY_MAX_DAYS:
-            return False, "above_entry_window"
+        if days_to_resolution > MAX_ALLOWED_DAYS:
+            return False, "too_far_from_resolution"
 
         if midpoint is None:
             return False, "missing_midpoint"
@@ -382,17 +381,16 @@ class ClobAnalyzer:
 
         vol_ok = volatility is not None and volatility > 0.003
         move_ok = avg_abs_change is not None and avg_abs_change > 0.0015
-
         if not (vol_ok and move_ok):
             return False, "no_meaningful_movement"
 
         if return_pct is None:
             return False, "missing_return"
 
-        if return_pct < -5:
-            return False, "not_buy_trending"
+        if return_pct < -8:
+            return False, "return_too_negative"
 
-        if trend_consistency is None or trend_consistency < 0.35:
+        if trend_consistency is None or trend_consistency < 0.30:
             return False, "weak_trend_consistency"
 
         if return_pct > 80:
@@ -443,7 +441,7 @@ class ClobAnalyzer:
         btc_bonus = btc_relevance_score * 2.0
         liquidity_bonus = ClobAnalyzer._compute_liquidity_bonus(liquidity, volume)
 
-        yes_bias_penalty = 0.03 if outcome.upper() == "YES" and (days_to_resolution or 0) >= NEW_ENTRY_MIN_DAYS else 0.0
+        yes_bias_penalty = 0.03 if outcome.upper() == "YES" and (days_to_resolution or 0) >= PREFERRED_MIN_DAYS else 0.0
 
         raw_score = (
             1.6 * history_term
@@ -506,35 +504,30 @@ class ClobAnalyzer:
             midpoint = self.get_midpoint(token_id)
         except Exception:
             midpoint = None
-
         time.sleep(self.sleep_between_calls)
 
         try:
             buy_price = self.get_price(token_id, "BUY")
         except Exception:
             buy_price = None
-
         time.sleep(self.sleep_between_calls)
 
         try:
             sell_price = self.get_price(token_id, "SELL")
         except Exception:
             sell_price = None
-
         time.sleep(self.sleep_between_calls)
 
         try:
             spread = self.get_spread(token_id)
         except Exception:
             spread = None
-
         time.sleep(self.sleep_between_calls)
 
         try:
             last_trade_price, last_trade_side = self.get_last_trade_price(token_id)
         except Exception:
             last_trade_price, last_trade_side = None, None
-
         time.sleep(self.sleep_between_calls)
 
         try:

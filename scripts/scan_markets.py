@@ -5,12 +5,13 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from bot.config import load_config
 from bot.market_scoring import compute_market_score
 from bot.polymarket_client import PolymarketClient
 
@@ -33,6 +34,11 @@ BTC_KEYWORDS = [
     "ath",
     "all time high",
 ]
+
+MIN_DAYS = 8.0
+MAX_DAYS = 90.0
+MIN_LIQUIDITY = 500.0
+MAX_SPREAD = 0.05
 
 
 @dataclass
@@ -63,15 +69,12 @@ class ScannedMarket:
 
 
 def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-
-    value = value.strip()
-    if not value:
+    text = str(value or "").strip()
+    if not text:
         return None
 
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
 
@@ -123,10 +126,10 @@ def market_is_allowed(
     midpoint: Optional[float],
     spread: Optional[float],
     liquidity: Optional[float],
-    min_days: float = 15.0,
-    max_days: float = 60.0,
-    min_liquidity: float = 1000.0,
-    max_spread: float = 0.05,
+    min_days: float = MIN_DAYS,
+    max_days: float = MAX_DAYS,
+    min_liquidity: float = MIN_LIQUIDITY,
+    max_spread: float = MAX_SPREAD,
 ) -> bool:
     if not is_btc_market(question, event_title):
         return False
@@ -149,9 +152,18 @@ def market_is_allowed(
     return True
 
 
-def extract_book_data(book: Dict[str, Any]) -> Dict[str, Optional[float]]:
-    best_bid = safe_float(book.get("best_bid") or book.get("bestBid"))
-    best_ask = safe_float(book.get("best_ask") or book.get("bestAsk"))
+def get_attr_or_key(obj: Any, *names: str) -> Any:
+    for name in names:
+        if isinstance(obj, dict) and name in obj:
+            return obj.get(name)
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return None
+
+
+def extract_book_data(book: Any) -> dict[str, Optional[float]]:
+    best_bid = safe_float(get_attr_or_key(book, "best_bid", "bestBid"))
+    best_ask = safe_float(get_attr_or_key(book, "best_ask", "bestAsk"))
     midpoint = compute_midpoint(best_bid, best_ask)
     spread = compute_spread(best_bid, best_ask)
 
@@ -165,12 +177,12 @@ def extract_book_data(book: Dict[str, Any]) -> Dict[str, Optional[float]]:
 
 def build_scanned_market(
     *,
-    market: Dict[str, Any],
-    token: Dict[str, Any],
-    book: Dict[str, Any],
+    market: dict[str, Any],
+    token: dict[str, Any],
+    book: Any,
 ) -> Optional[ScannedMarket]:
-    question = market.get("question", "") or ""
-    event_title = market.get("event_title") or market.get("eventTitle") or ""
+    question = str(market.get("question", "") or "")
+    event_title = str(market.get("event_title") or market.get("eventTitle") or "")
     market_id = str(market.get("id", "") or "")
     token_id = str(token.get("token_id") or token.get("tokenId") or "")
     side = str(token.get("outcome") or token.get("side") or "YES").upper()
@@ -246,7 +258,7 @@ def fetch_tradeable_btc_markets(client: PolymarketClient, max_pages: int = 10) -
 
         for market in markets:
             tokens = market.get("tokens") or market.get("outcomes") or []
-            if not tokens:
+            if not isinstance(tokens, list) or not tokens:
                 continue
 
             for token in tokens:
@@ -260,7 +272,11 @@ def fetch_tradeable_btc_markets(client: PolymarketClient, max_pages: int = 10) -
                     print(f"Failed to fetch order book for token {token_id}: {exc}")
                     continue
 
-                item = build_scanned_market(market=market, token=token, book=book)
+                item = build_scanned_market(
+                    market=market,
+                    token=token,
+                    book=book,
+                )
                 if item is not None:
                     scanned.append(item)
 
@@ -276,7 +292,8 @@ def fetch_tradeable_btc_markets(client: PolymarketClient, max_pages: int = 10) -
 def main() -> None:
     OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
 
-    client = PolymarketClient()
+    config = load_config()
+    client = PolymarketClient(config.polymarket)
 
     print("Fetching BTC-focused tradeable markets...")
     results = fetch_tradeable_btc_markets(client=client, max_pages=10)
