@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import statistics
 import sys
 import time
 from collections import Counter
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -23,14 +24,24 @@ BTC_KEYWORDS = [
     "btc",
     "xbt",
     "satoshi",
-    "ath",
+    "bitcoin price",
+    "btc price",
+    "bitcoin etf",
+    "btc etf",
+    "bitcoin above",
+    "bitcoin below",
+    "will bitcoin",
+    "bitcoin reach",
+    "bitcoin hit",
+    "bitcoin dip",
     "all time high",
+    "ath",
 ]
 
-PREFERRED_MIN_DAYS = 15.0
-PREFERRED_MAX_DAYS = 60.0
-MAX_ALLOWED_DAYS = 90.0
-FORCE_EXIT_DAYS = 7.0
+PREFERRED_MIN_DAYS = 2.0
+PREFERRED_MAX_DAYS = 180.0
+MAX_ALLOWED_DAYS = 365.0
+FORCE_EXIT_DAYS = 1.0
 
 
 @dataclass
@@ -87,7 +98,7 @@ class ClobAnalyzer:
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "clob-market-analyzer-standalone/7.0-btc-focused",
+                "User-Agent": "clob-market-analyzer-standalone/8.0-btc-focused",
             }
         )
         self.exclusion_reasons: Counter[str] = Counter()
@@ -126,31 +137,83 @@ class ClobAnalyzer:
         return (parsed - now).total_seconds() / 86400.0
 
     @staticmethod
-    def _is_btc_market_text(question: Optional[str], event_title: Optional[str]) -> bool:
-        text = f"{question or ''} {event_title or ''}".strip().lower()
+    def _normalize_text(text: str) -> str:
+        text = text.lower()
+        text = re.sub(r"[^a-z0-9\s\-\$]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    @classmethod
+    def _contains_keyword(cls, text: str, keyword: str) -> bool:
+        normalized_text = cls._normalize_text(text)
+        normalized_keyword = cls._normalize_text(keyword)
+
+        if not normalized_keyword:
+            return False
+
+        if " " in normalized_keyword or "-" in normalized_keyword:
+            return normalized_keyword in normalized_text
+
+        pattern = rf"\b{re.escape(normalized_keyword)}\b"
+        return re.search(pattern, normalized_text) is not None
+
+    @classmethod
+    def _build_btc_text(
+        cls,
+        question: Optional[str],
+        event_title: Optional[str],
+        url: Optional[str],
+    ) -> str:
+        return " ".join(
+            [
+                str(question or ""),
+                str(event_title or ""),
+                str(url or ""),
+            ]
+        ).strip()
+
+    @classmethod
+    def _is_btc_market_text(
+        cls,
+        question: Optional[str],
+        event_title: Optional[str],
+        url: Optional[str],
+    ) -> bool:
+        text = cls._build_btc_text(question, event_title, url)
         if not text:
             return False
-        return any(keyword in text for keyword in BTC_KEYWORDS)
+        return any(cls._contains_keyword(text, keyword) for keyword in BTC_KEYWORDS)
 
-    @staticmethod
-    def _compute_btc_relevance_score(question: Optional[str], event_title: Optional[str]) -> float:
-        text = f"{question or ''} {event_title or ''}".strip().lower()
+    @classmethod
+    def _compute_btc_relevance_score(
+        cls,
+        question: Optional[str],
+        event_title: Optional[str],
+        url: Optional[str],
+    ) -> float:
+        text = cls._normalize_text(cls._build_btc_text(question, event_title, url))
         if not text:
             return 0.0
 
         score = 0.0
 
-        if "bitcoin" in text:
-            score += 0.50
-        if "btc" in text:
-            score += 0.40
-        if "ath" in text or "all time high" in text:
+        if cls._contains_keyword(text, "bitcoin"):
+            score += 0.60
+        if cls._contains_keyword(text, "btc"):
+            score += 0.45
+        if cls._contains_keyword(text, "xbt"):
+            score += 0.35
+        if cls._contains_keyword(text, "satoshi"):
+            score += 0.25
+        if cls._contains_keyword(text, "ath") or cls._contains_keyword(text, "all time high"):
             score += 0.15
         if "above" in text or "below" in text:
             score += 0.10
-        if "reach" in text or "hit" in text:
+        if "reach" in text or "hit" in text or "dip" in text:
             score += 0.10
         if "price" in text or "$" in text:
+            score += 0.10
+        if "etf" in text:
             score += 0.10
 
         return min(score, 1.0)
@@ -163,11 +226,11 @@ class ClobAnalyzer:
             return 3.0
         if days_to_resolution < PREFERRED_MIN_DAYS:
             return 0.8
-        if days_to_resolution > PREFERRED_MAX_DAYS and days_to_resolution <= MAX_ALLOWED_DAYS:
+        if PREFERRED_MIN_DAYS <= days_to_resolution <= PREFERRED_MAX_DAYS:
+            return 0.0
+        if days_to_resolution <= MAX_ALLOWED_DAYS:
             return 0.6
-        if days_to_resolution > MAX_ALLOWED_DAYS:
-            return 2.0
-        return 0.0
+        return 2.0
 
     @staticmethod
     def _compute_liquidity_bonus(liquidity: Optional[float], volume: Optional[float]) -> float:
@@ -497,8 +560,8 @@ class ClobAnalyzer:
         history: List[Dict[str, Any]] = []
 
         days_to_resolution = self._compute_days_to_resolution(parent_end_date)
-        is_btc_market = self._is_btc_market_text(parent_question, parent_event_title)
-        btc_relevance_score = self._compute_btc_relevance_score(parent_question, parent_event_title)
+        is_btc_market = self._is_btc_market_text(parent_question, parent_event_title, parent_url)
+        btc_relevance_score = self._compute_btc_relevance_score(parent_question, parent_event_title, parent_url)
 
         try:
             midpoint = self.get_midpoint(token_id)
