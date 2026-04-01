@@ -18,21 +18,52 @@ from bot.polymarket_client import PolymarketClient
 
 OUTPUT_JSON = PROJECT_ROOT / "data" / "btc_markets_scan.json"
 
+# Keywords fortes e específicas
 BTC_KEYWORDS = [
     "bitcoin",
     "btc",
+    "xbt",
     "bitcoin price",
-    "will bitcoin",
-    "will btc",
     "btc price",
-    "reach",
-    "hit",
-    "above",
-    "below",
-    "close above",
-    "close below",
-    "ath",
-    "all time high",
+    "bitcoin etf",
+    "btc etf",
+    "bitcoin ath",
+    "btc ath",
+    "all time high bitcoin",
+    "all time high btc",
+    "bitcoin dominance",
+    "btc dominance",
+    "satoshi",
+]
+
+CRYPTO_KEYWORDS = [
+    "bitcoin",
+    "btc",
+    "xbt",
+    "ethereum",
+    "eth",
+    "solana",
+    "sol",
+    "ripple",
+    "xrp",
+    "dogecoin",
+    "doge",
+    "cardano",
+    "ada",
+    "avalanche",
+    "avax",
+    "crypto",
+    "cryptocurrency",
+    "stablecoin",
+    "defi",
+    "nft",
+    "altcoin",
+    "memecoin",
+    "meme coin",
+    "binance",
+    "coinbase",
+    "blackrock bitcoin etf",
+    "spot bitcoin etf",
 ]
 
 MIN_DAYS = 8.0
@@ -113,9 +144,44 @@ def compute_spread(best_bid: Optional[float], best_ask: Optional[float]) -> Opti
     return best_ask - best_bid
 
 
-def is_btc_market(question: str, event_title: str) -> bool:
-    text = f"{question} {event_title}".lower()
+def get_market_text(market: dict[str, Any]) -> str:
+    parts = [
+        str(market.get("question") or ""),
+        str(market.get("title") or ""),
+        str(market.get("event_title") or market.get("eventTitle") or ""),
+        str(market.get("description") or ""),
+        str(market.get("category") or ""),
+        str(market.get("subcategory") or ""),
+    ]
+    return " ".join(parts).lower().strip()
+
+
+def is_crypto_market(market: dict[str, Any]) -> bool:
+    text = get_market_text(market)
+    return any(keyword in text for keyword in CRYPTO_KEYWORDS)
+
+
+def is_btc_market(market: dict[str, Any]) -> bool:
+    text = get_market_text(market)
     return any(keyword in text for keyword in BTC_KEYWORDS)
+
+
+def market_has_valid_status(market: dict[str, Any]) -> bool:
+    active = market.get("active")
+    closed = market.get("closed")
+    archived = market.get("archived")
+    enable_order_book = market.get("enable_order_book", market.get("enableOrderBook"))
+
+    if active is False:
+        return False
+    if closed is True:
+        return False
+    if archived is True:
+        return False
+    if enable_order_book is False:
+        return False
+
+    return True
 
 
 def market_is_allowed(
@@ -131,9 +197,6 @@ def market_is_allowed(
     min_liquidity: float = MIN_LIQUIDITY,
     max_spread: float = MAX_SPREAD,
 ) -> bool:
-    if not is_btc_market(question, event_title):
-        return False
-
     if days_to_resolution < min_days or days_to_resolution > max_days:
         return False
 
@@ -182,7 +245,7 @@ def build_scanned_market(
     book: Any,
 ) -> Optional[ScannedMarket]:
     question = str(market.get("question", "") or "")
-    event_title = str(market.get("event_title") or market.get("eventTitle") or "")
+    event_title = str(market.get("event_title") or market.get("eventTitle") or market.get("title") or "")
     market_id = str(market.get("id", "") or "")
     token_id = str(token.get("token_id") or token.get("tokenId") or "")
     side = str(token.get("outcome") or token.get("side") or "YES").upper()
@@ -246,6 +309,10 @@ def fetch_tradeable_btc_markets(client: PolymarketClient, max_pages: int = 10) -
     scanned: List[ScannedMarket] = []
     cursor: Optional[str] = None
 
+    total_markets_seen = 0
+    crypto_markets_seen = 0
+    btc_markets_seen = 0
+
     for page in range(1, max_pages + 1):
         print(f"Scanning page {page} with cursor={cursor}")
 
@@ -257,6 +324,25 @@ def fetch_tradeable_btc_markets(client: PolymarketClient, max_pages: int = 10) -
             break
 
         for market in markets:
+            total_markets_seen += 1
+
+            if not market_has_valid_status(market):
+                continue
+
+            # 1º filtro: crypto only
+            if not is_crypto_market(market):
+                continue
+            crypto_markets_seen += 1
+
+            # 2º filtro: BTC only
+            if not is_btc_market(market):
+                continue
+            btc_markets_seen += 1
+
+            question = str(market.get("question") or "")
+            event_title = str(market.get("event_title") or market.get("eventTitle") or market.get("title") or "")
+            print(f"[BTC MARKET] {question or event_title}")
+
             tokens = market.get("tokens") or market.get("outcomes") or []
             if not isinstance(tokens, list) or not tokens:
                 continue
@@ -284,6 +370,15 @@ def fetch_tradeable_btc_markets(client: PolymarketClient, max_pages: int = 10) -
             break
 
         cursor = next_cursor
+
+    print()
+    print("DISCOVERY SUMMARY")
+    print("=" * 80)
+    print(f"Total markets scanned : {total_markets_seen}")
+    print(f"Crypto markets found  : {crypto_markets_seen}")
+    print(f"BTC markets found     : {btc_markets_seen}")
+    print(f"BTC markets kept      : {len(scanned)}")
+    print("=" * 80)
 
     scanned.sort(key=lambda x: x.total_score, reverse=True)
     return scanned
