@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 
 class Signal(str, Enum):
@@ -15,180 +15,295 @@ class Signal(str, Enum):
 class StrategyResult:
     signal: Signal
     reason: str
-    metadata: Dict[str, Any]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class CandidateMarket:
-    market_id: str
-    token_id: str
-    question: str
-    side: str
-    score: float
-    days_to_resolution: float
-    spread: Optional[float]
-    liquidity: Optional[float]
-    midpoint: Optional[float]
+class TraderState:
+    positions: Dict[str, Any] = field(default_factory=dict)
 
 
 class Trader:
+    """
+    Trader compatível com o resto do projeto atual.
+
+    Esperado por run_paper.py:
+      - Trader(strategies=..., execution_engine=...)
+      - process_market(...)
+      - order_manager
+      - state
+
+    Objetivo:
+      - correr a strategy escolhida
+      - enriquecer metadata
+      - tentar executar via execution_engine quando houver BUY/SELL
+      - manter compatibilidade mesmo se execution_engine / strategy tiverem APIs ligeiramente diferentes
+    """
+
     def __init__(
         self,
-        switch_improvement_ratio: float = 1.25,
-        force_exit_days: float = 7.0,
-        hold_max_spread: float = 0.08,
-        hold_min_liquidity: float = 500.0,
+        *,
+        strategies: Dict[str, Any],
+        execution_engine: Any,
     ) -> None:
-        self.switch_improvement_ratio = switch_improvement_ratio
-        self.force_exit_days = force_exit_days
-        self.hold_max_spread = hold_max_spread
-        self.hold_min_liquidity = hold_min_liquidity
+        self.strategies = strategies or {}
+        self.execution_engine = execution_engine
 
-        self.current_market_id: Optional[str] = None
-        self.current_token_id: Optional[str] = None
-        self.current_market_score: float = 0.0
-        self.has_open_position: bool = False
+        # Compatibilidade com o resto do projeto
+        self.order_manager = getattr(execution_engine, "order_manager", None)
+        self.state = getattr(execution_engine, "state", TraderState())
 
-    def reset_current_market(self) -> None:
-        self.current_market_id = None
-        self.current_token_id = None
-        self.current_market_score = 0.0
+    def _normalize_signal(self, value: Any) -> Signal:
+        if isinstance(value, Signal):
+            return value
 
-    def should_hold_market(self, market: CandidateMarket) -> bool:
-        if market.days_to_resolution <= self.force_exit_days:
-            return False
+        text = str(value or "").strip().upper()
+        if text == "BUY":
+            return Signal.BUY
+        if text == "SELL":
+            return Signal.SELL
+        return Signal.HOLD
 
-        if market.spread is None or market.spread > self.hold_max_spread:
-            return False
-
-        if market.liquidity is None or market.liquidity < self.hold_min_liquidity:
-            return False
-
-        return True
-
-    def should_switch_market(self, current_market: CandidateMarket, candidate_market: CandidateMarket) -> bool:
-        if candidate_market.market_id == current_market.market_id:
-            return False
-
-        if current_market.score <= 0:
-            return True
-
-        return candidate_market.score >= current_market.score * self.switch_improvement_ratio
-
-    def select_best_market(self, markets: List[CandidateMarket]) -> Optional[CandidateMarket]:
-        if not markets:
-            return None
-        return max(markets, key=lambda m: m.score)
-
-    def get_current_market(self, markets: List[CandidateMarket]) -> Optional[CandidateMarket]:
-        if self.current_market_id is None:
-            return None
-
-        for market in markets:
-            if market.market_id == self.current_market_id:
-                return market
-
-        return None
-
-    def choose_active_market(self, markets: List[CandidateMarket]) -> Optional[CandidateMarket]:
-        best_market = self.select_best_market(markets)
-        if best_market is None:
-            return None
-
-        current_market = self.get_current_market(markets)
-
-        if current_market is None:
-            self.current_market_id = best_market.market_id
-            self.current_token_id = best_market.token_id
-            self.current_market_score = best_market.score
-            return best_market
-
-        if not self.should_hold_market(current_market):
-            self.current_market_id = best_market.market_id
-            self.current_token_id = best_market.token_id
-            self.current_market_score = best_market.score
-            return best_market
-
-        if self.should_switch_market(current_market, best_market):
-            self.current_market_id = best_market.market_id
-            self.current_token_id = best_market.token_id
-            self.current_market_score = best_market.score
-            return best_market
-
-        self.current_market_score = current_market.score
-        return current_market
-
-    def evaluate_position_management(
-        self,
-        market: CandidateMarket,
-        technical_signal: Signal,
-        technical_reason: str,
-    ) -> StrategyResult:
-        if market.days_to_resolution <= self.force_exit_days:
-            return StrategyResult(
-                signal=Signal.SELL,
-                reason="force_exit_near_resolution",
-                metadata={
-                    "market_id": market.market_id,
-                    "token_id": market.token_id,
-                    "days_to_resolution": market.days_to_resolution,
-                },
-            )
-
-        if market.spread is None or market.spread > self.hold_max_spread:
-            return StrategyResult(
-                signal=Signal.SELL,
-                reason="force_exit_spread_too_wide",
-                metadata={
-                    "market_id": market.market_id,
-                    "token_id": market.token_id,
-                    "spread": market.spread,
-                },
-            )
-
-        if market.liquidity is None or market.liquidity < self.hold_min_liquidity:
-            return StrategyResult(
-                signal=Signal.SELL,
-                reason="force_exit_low_liquidity",
-                metadata={
-                    "market_id": market.market_id,
-                    "token_id": market.token_id,
-                    "liquidity": market.liquidity,
-                },
-            )
-
-        return StrategyResult(
-            signal=technical_signal,
-            reason=technical_reason,
-            metadata={
-                "market_id": market.market_id,
-                "token_id": market.token_id,
-                "score": market.score,
-                "side": market.side,
-                "days_to_resolution": market.days_to_resolution,
-                "spread": market.spread,
-                "liquidity": market.liquidity,
-                "midpoint": market.midpoint,
-            },
-        )
-
-    def process(
-        self,
-        markets: List[CandidateMarket],
-        technical_signal: Signal,
-        technical_reason: str,
-    ) -> StrategyResult:
-        active_market = self.choose_active_market(markets)
-
-        if active_market is None:
+    def _coerce_strategy_result(self, raw_result: Any) -> StrategyResult:
+        if raw_result is None:
             return StrategyResult(
                 signal=Signal.HOLD,
-                reason="no_valid_btc_market",
+                reason="strategy_returned_none",
                 metadata={},
             )
 
-        return self.evaluate_position_management(
-            market=active_market,
-            technical_signal=technical_signal,
-            technical_reason=technical_reason,
+        if isinstance(raw_result, StrategyResult):
+            raw_result.signal = self._normalize_signal(raw_result.signal)
+            if raw_result.metadata is None:
+                raw_result.metadata = {}
+            return raw_result
+
+        signal = self._normalize_signal(getattr(raw_result, "signal", None))
+        reason = str(getattr(raw_result, "reason", "unknown_strategy_reason") or "unknown_strategy_reason")
+        metadata = getattr(raw_result, "metadata", {}) or {}
+
+        if not isinstance(metadata, dict):
+            metadata = {"raw_metadata": metadata}
+
+        return StrategyResult(
+            signal=signal,
+            reason=reason,
+            metadata=metadata,
+        )
+
+    def _run_strategy(
+        self,
+        *,
+        strategy_name: str,
+        context: Any,
+    ) -> StrategyResult:
+        strategy = self.strategies.get(strategy_name)
+        if strategy is None:
+            return StrategyResult(
+                signal=Signal.HOLD,
+                reason=f"unknown_strategy:{strategy_name}",
+                metadata={},
+            )
+
+        # Tenta vários nomes de método para compatibilidade
+        raw_result = None
+
+        if hasattr(strategy, "generate_signal"):
+            raw_result = strategy.generate_signal(context)
+        elif hasattr(strategy, "evaluate"):
+            raw_result = strategy.evaluate(context)
+        elif hasattr(strategy, "process"):
+            raw_result = strategy.process(context)
+        elif hasattr(strategy, "run"):
+            raw_result = strategy.run(context)
+        else:
+            return StrategyResult(
+                signal=Signal.HOLD,
+                reason=f"strategy_has_no_supported_entrypoint:{strategy_name}",
+                metadata={},
+            )
+
+        return self._coerce_strategy_result(raw_result)
+
+    def _build_hold_result(
+        self,
+        *,
+        strategy_result: StrategyResult,
+        token_id: str,
+        best_bid: float,
+        best_ask: float,
+        order_size: float,
+    ) -> StrategyResult:
+        metadata = dict(strategy_result.metadata or {})
+        metadata.setdefault("token_id", token_id)
+        metadata.setdefault("best_bid", best_bid)
+        metadata.setdefault("best_ask", best_ask)
+        metadata.setdefault("order_size_requested", order_size)
+        metadata.setdefault("order_status", "NONE")
+
+        return StrategyResult(
+            signal=Signal.HOLD,
+            reason=strategy_result.reason,
+            metadata=metadata,
+        )
+
+    def _execute_signal(
+        self,
+        *,
+        signal_result: StrategyResult,
+        token_id: str,
+        best_bid: float,
+        best_ask: float,
+        order_size: float,
+    ) -> StrategyResult:
+        """
+        Tenta executar a ordem usando diferentes formatos de API do execution_engine.
+        """
+        metadata = dict(signal_result.metadata or {})
+        metadata.setdefault("token_id", token_id)
+        metadata.setdefault("best_bid", best_bid)
+        metadata.setdefault("best_ask", best_ask)
+        metadata.setdefault("order_size_requested", order_size)
+
+        if self.execution_engine is None:
+            metadata.setdefault("order_status", "NOT_EXECUTED")
+            return StrategyResult(
+                signal=signal_result.signal,
+                reason=signal_result.reason,
+                metadata=metadata,
+            )
+
+        try:
+            # API 1: execute_signal(signal=..., token_id=..., best_bid=..., best_ask=..., order_size=..., metadata=...)
+            if hasattr(self.execution_engine, "execute_signal"):
+                executed = self.execution_engine.execute_signal(
+                    signal=signal_result.signal.value,
+                    token_id=token_id,
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    order_size=order_size,
+                    metadata=metadata,
+                )
+                return self._merge_execution_result(signal_result, executed, metadata)
+
+            # API 2: execute_trade(...)
+            if hasattr(self.execution_engine, "execute_trade"):
+                executed = self.execution_engine.execute_trade(
+                    signal=signal_result.signal.value,
+                    token_id=token_id,
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    order_size=order_size,
+                    metadata=metadata,
+                )
+                return self._merge_execution_result(signal_result, executed, metadata)
+
+            # API 3: place_order(...)
+            if hasattr(self.execution_engine, "place_order"):
+                side = metadata.get("side") or metadata.get("position_side") or signal_result.signal.value
+                executed = self.execution_engine.place_order(
+                    token_id=token_id,
+                    side=side,
+                    best_bid=best_bid,
+                    best_ask=best_ask,
+                    size=order_size,
+                    metadata=metadata,
+                )
+                return self._merge_execution_result(signal_result, executed, metadata)
+
+        except Exception as exc:
+            metadata["order_status"] = "ERROR"
+            metadata["execution_error"] = str(exc)
+            return StrategyResult(
+                signal=signal_result.signal,
+                reason=f"{signal_result.reason}|execution_error",
+                metadata=metadata,
+            )
+
+        metadata.setdefault("order_status", "NOT_EXECUTED")
+        return StrategyResult(
+            signal=signal_result.signal,
+            reason=signal_result.reason,
+            metadata=metadata,
+        )
+
+    def _merge_execution_result(
+        self,
+        strategy_result: StrategyResult,
+        executed: Any,
+        fallback_metadata: Dict[str, Any],
+    ) -> StrategyResult:
+        if executed is None:
+            metadata = dict(fallback_metadata)
+            metadata.setdefault("order_status", "NONE")
+            return StrategyResult(
+                signal=strategy_result.signal,
+                reason=strategy_result.reason,
+                metadata=metadata,
+            )
+
+        if isinstance(executed, StrategyResult):
+            executed.signal = self._normalize_signal(executed.signal)
+            executed.metadata = executed.metadata or {}
+            return executed
+
+        if hasattr(executed, "signal") and hasattr(executed, "reason"):
+            coerced = self._coerce_strategy_result(executed)
+            coerced.metadata = coerced.metadata or {}
+            if "order_status" not in coerced.metadata:
+                coerced.metadata["order_status"] = "UNKNOWN"
+            return coerced
+
+        metadata = dict(fallback_metadata)
+        if isinstance(executed, dict):
+            metadata.update(executed)
+
+        metadata.setdefault("order_status", "UNKNOWN")
+
+        return StrategyResult(
+            signal=strategy_result.signal,
+            reason=strategy_result.reason,
+            metadata=metadata,
+        )
+
+    def process_market(
+        self,
+        *,
+        strategy_name: str,
+        context: Any,
+        best_bid: float,
+        best_ask: float,
+        order_size: float,
+        token_id: str,
+    ) -> StrategyResult:
+        """
+        Método esperado pelo run_paper.py
+        """
+        strategy_result = self._run_strategy(
+            strategy_name=strategy_name,
+            context=context,
+        )
+
+        metadata = dict(strategy_result.metadata or {})
+        metadata.setdefault("token_id", token_id)
+        metadata.setdefault("best_bid", best_bid)
+        metadata.setdefault("best_ask", best_ask)
+        metadata.setdefault("order_size_requested", order_size)
+        strategy_result.metadata = metadata
+
+        if strategy_result.signal == Signal.HOLD:
+            return self._build_hold_result(
+                strategy_result=strategy_result,
+                token_id=token_id,
+                best_bid=best_bid,
+                best_ask=best_ask,
+                order_size=order_size,
+            )
+
+        return self._execute_signal(
+            signal_result=strategy_result,
+            token_id=token_id,
+            best_bid=best_bid,
+            best_ask=best_ask,
+            order_size=order_size,
         )
