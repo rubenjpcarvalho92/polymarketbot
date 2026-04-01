@@ -1,303 +1,307 @@
 from __future__ import annotations
 
+import json
 import sys
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, List, Optional
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from bot.config import load_config
+from bot.market_scoring import compute_market_score
 from bot.polymarket_client import PolymarketClient
 
 
-def to_float(value: Any, default: float = 0.0) -> float:
+OUTPUT_JSON = PROJECT_ROOT / "data" / "btc_markets_scan.json"
+
+BTC_KEYWORDS = [
+    "bitcoin",
+    "btc",
+    "bitcoin price",
+    "will bitcoin",
+    "will btc",
+    "btc price",
+    "reach",
+    "hit",
+    "above",
+    "below",
+    "close above",
+    "close below",
+    "ath",
+    "all time high",
+]
+
+
+@dataclass
+class ScannedMarket:
+    market_id: str
+    token_id: str
+    question: str
+    event_title: str
+    url: Optional[str]
+    side: str
+    end_date: Optional[str]
+    days_to_resolution: float
+
+    best_bid: Optional[float]
+    best_ask: Optional[float]
+    midpoint: Optional[float]
+    spread: Optional[float]
+
+    liquidity: Optional[float]
+    volume: Optional[float]
+
+    time_score: float
+    liquidity_score: float
+    spread_score: float
+    price_score: float
+    technical_score: float
+    total_score: float
+
+
+def parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+
+    value = value.strip()
+    if not value:
+        return None
+
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def compute_days_to_resolution(end_date: Optional[str]) -> float:
+    dt = parse_iso_datetime(end_date)
+    if dt is None:
+        return 9999.0
+
+    now = datetime.now(timezone.utc)
+    return (dt - now).total_seconds() / 86400.0
+
+
+def safe_float(value: Any) -> Optional[float]:
     try:
         if value is None or value == "":
-            return default
+            return None
         return float(value)
     except (TypeError, ValueError):
-        return default
+        return None
 
 
-def extract_items_and_cursor(markets: Any) -> tuple[list[Any], str | None]:
-    if isinstance(markets, dict):
-        items = (
-            markets.get("data")
-            or markets.get("markets")
-            or markets.get("items")
-            or []
-        )
-        next_cursor = (
-            markets.get("next_cursor")
-            or markets.get("nextCursor")
-            or markets.get("cursor")
-        )
-        return items, next_cursor
-    return list(markets or []), None
+def compute_midpoint(best_bid: Optional[float], best_ask: Optional[float]) -> Optional[float]:
+    if best_bid is None or best_ask is None:
+        return None
+    if best_bid <= 0 and best_ask <= 0:
+        return None
+    return (best_bid + best_ask) / 2.0
 
 
-def extract_market_question(market: Any) -> str:
-    if isinstance(market, dict):
-        return (
-            market.get("question")
-            or market.get("title")
-            or market.get("description")
-            or "N/A"
-        )
-    return (
-        getattr(market, "question", None)
-        or getattr(market, "title", None)
-        or getattr(market, "description", None)
-        or "N/A"
-    )
+def compute_spread(best_bid: Optional[float], best_ask: Optional[float]) -> Optional[float]:
+    if best_bid is None or best_ask is None:
+        return None
+    if best_ask < best_bid:
+        return None
+    return best_ask - best_bid
 
 
-def extract_tokens(market: Any) -> list[dict[str, Any]]:
-    if isinstance(market, dict):
-        tokens = market.get("tokens") or market.get("outcomes") or []
-    else:
-        tokens = getattr(market, "tokens", None) or getattr(market, "outcomes", None) or []
-
-    normalized: list[dict[str, Any]] = []
-
-    for token in tokens:
-        if isinstance(token, dict):
-            token_id = (
-                token.get("token_id")
-                or token.get("tokenId")
-                or token.get("id")
-                or token.get("asset_id")
-            )
-            label = (
-                token.get("outcome")
-                or token.get("name")
-                or token.get("label")
-                or ""
-            )
-        else:
-            token_id = (
-                getattr(token, "token_id", None)
-                or getattr(token, "tokenId", None)
-                or getattr(token, "id", None)
-                or getattr(token, "asset_id", None)
-            )
-            label = (
-                getattr(token, "outcome", None)
-                or getattr(token, "name", None)
-                or getattr(token, "label", None)
-                or ""
-            )
-
-        if token_id:
-            normalized.append(
-                {
-                    "token_id": str(token_id),
-                    "label": str(label),
-                }
-            )
-
-    return normalized
+def is_btc_market(question: str, event_title: str) -> bool:
+    text = f"{question} {event_title}".lower()
+    return any(keyword in text for keyword in BTC_KEYWORDS)
 
 
-def is_tradeable_market(market: Any) -> bool:
-    if isinstance(market, dict):
-        active = bool(market.get("active", False))
-        closed = bool(market.get("closed", False))
-        archived = bool(market.get("archived", False))
-        accepting_orders = bool(market.get("accepting_orders", False))
-        enable_order_book = bool(market.get("enable_order_book", False))
-    else:
-        active = bool(getattr(market, "active", False))
-        closed = bool(getattr(market, "closed", False))
-        archived = bool(getattr(market, "archived", False))
-        accepting_orders = bool(getattr(market, "accepting_orders", False))
-        enable_order_book = bool(getattr(market, "enable_order_book", False))
-
-    return (
-        active
-        and not closed
-        and not archived
-        and accepting_orders
-        and enable_order_book
-    )
-
-
-def has_valid_book(best_bid: float, best_ask: float) -> bool:
-    return best_bid > 0 and best_ask > 0 and best_ask > best_bid
-
-
-def is_interesting(best_bid: float, best_ask: float, liquidity: float) -> bool:
-    if not has_valid_book(best_bid, best_ask):
+def market_is_allowed(
+    *,
+    question: str,
+    event_title: str,
+    days_to_resolution: float,
+    midpoint: Optional[float],
+    spread: Optional[float],
+    liquidity: Optional[float],
+    min_days: float = 15.0,
+    max_days: float = 60.0,
+    min_liquidity: float = 1000.0,
+    max_spread: float = 0.05,
+) -> bool:
+    if not is_btc_market(question, event_title):
         return False
 
-    spread = best_ask - best_bid
+    if days_to_resolution < min_days or days_to_resolution > max_days:
+        return False
 
-    if spread > 0.08:
+    if midpoint is None:
         return False
-    if liquidity < 1000:
+
+    if midpoint < 0.10 or midpoint > 0.90:
         return False
-    if best_bid < 0.02:
+
+    if spread is None or spread > max_spread:
         return False
-    if best_ask > 0.98:
+
+    if liquidity is None or liquidity < min_liquidity:
         return False
 
     return True
 
 
-def score_market(best_bid: float, best_ask: float, liquidity: float) -> float:
-    spread = best_ask - best_bid
-    if spread <= 0:
-        return 0.0
-    return liquidity / spread
+def extract_book_data(book: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    best_bid = safe_float(book.get("best_bid") or book.get("bestBid"))
+    best_ask = safe_float(book.get("best_ask") or book.get("bestAsk"))
+    midpoint = compute_midpoint(best_bid, best_ask)
+    spread = compute_spread(best_bid, best_ask)
+
+    return {
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "midpoint": midpoint,
+        "spread": spread,
+    }
 
 
-def print_market_block(index: int, item: dict[str, Any]) -> None:
-    print(f"{index}. {item['question']}")
-    print(f"   outcome   : {item['label']}")
-    print(f"   token_id  : {item['token_id']}")
-    print(f"   best_bid  : {item['best_bid']:.4f}")
-    print(f"   best_ask  : {item['best_ask']:.4f}")
-    print(f"   spread    : {item['spread']:.4f}")
-    print(f"   bid_size  : {item['bid_size']:.2f}")
-    print(f"   ask_size  : {item['ask_size']:.2f}")
-    print(f"   liquidity : {item['liquidity']:.2f}")
-    print(f"   score     : {item['score']:.2f}")
-    print("-" * 80)
+def build_scanned_market(
+    *,
+    market: Dict[str, Any],
+    token: Dict[str, Any],
+    book: Dict[str, Any],
+) -> Optional[ScannedMarket]:
+    question = market.get("question", "") or ""
+    event_title = market.get("event_title") or market.get("eventTitle") or ""
+    market_id = str(market.get("id", "") or "")
+    token_id = str(token.get("token_id") or token.get("tokenId") or "")
+    side = str(token.get("outcome") or token.get("side") or "YES").upper()
+    url = market.get("url")
+    end_date = market.get("end_date") or market.get("endDate")
+
+    liquidity = safe_float(market.get("liquidity"))
+    volume = safe_float(market.get("volume") or market.get("volumeNum"))
+    days = compute_days_to_resolution(end_date)
+
+    book_data = extract_book_data(book)
+    midpoint = book_data["midpoint"]
+    spread = book_data["spread"]
+    best_bid = book_data["best_bid"]
+    best_ask = book_data["best_ask"]
+
+    if not market_is_allowed(
+        question=question,
+        event_title=event_title,
+        days_to_resolution=days,
+        midpoint=midpoint,
+        spread=spread,
+        liquidity=liquidity,
+    ):
+        return None
+
+    score = compute_market_score(
+        days_to_resolution=days,
+        spread=spread,
+        mid_price=midpoint,
+        liquidity=liquidity,
+        technical_score=0.5,
+        side=side,
+    )
+
+    return ScannedMarket(
+        market_id=market_id,
+        token_id=token_id,
+        question=question,
+        event_title=event_title,
+        url=url,
+        side=side,
+        end_date=end_date,
+        days_to_resolution=days,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        midpoint=midpoint,
+        spread=spread,
+        liquidity=liquidity,
+        volume=volume,
+        time_score=score.time_score,
+        liquidity_score=score.liquidity_score,
+        spread_score=score.spread_score,
+        price_score=score.price_score,
+        technical_score=score.technical_score,
+        total_score=score.total_score,
+    )
 
 
-def main() -> None:
-    config = load_config()
-    client = PolymarketClient(config.polymarket)
+def fetch_tradeable_btc_markets(client: PolymarketClient, max_pages: int = 10) -> List[ScannedMarket]:
+    scanned: List[ScannedMarket] = []
+    cursor: Optional[str] = None
 
-    max_pages = 10
-    cursor = "MA=="
-    seen_cursors: set[str] = set()
+    for page in range(1, max_pages + 1):
+        print(f"Scanning page {page} with cursor={cursor}")
 
-    all_results: list[dict[str, Any]] = []
-    filtered_results: list[dict[str, Any]] = []
+        response = client.get_markets(cursor=cursor)
+        markets = response.get("data") or response.get("markets") or []
+        next_cursor = response.get("next_cursor") or response.get("nextCursor")
 
-    pages_scanned = 0
-    markets_scanned = 0
-    tradeable_markets = 0
-    tokens_scanned = 0
-    valid_books = 0
-
-    print("Fetching markets...")
-
-    while pages_scanned < max_pages and cursor and cursor not in seen_cursors:
-        seen_cursors.add(cursor)
-        pages_scanned += 1
-
-        print(f"Scanning page {pages_scanned} with cursor={cursor}")
-        response = client.get_markets(cursor)
-        market_items, next_cursor = extract_items_and_cursor(response)
-
-        if not market_items:
+        if not markets:
             break
 
-        for market in market_items:
-            markets_scanned += 1
-
-            if not is_tradeable_market(market):
+        for market in markets:
+            tokens = market.get("tokens") or market.get("outcomes") or []
+            if not tokens:
                 continue
 
-            tradeable_markets += 1
-            question = extract_market_question(market)
-            tokens = extract_tokens(market)
-
             for token in tokens:
-                tokens_scanned += 1
-                token_id = token["token_id"]
-                label = token["label"]
+                token_id = str(token.get("token_id") or token.get("tokenId") or "")
+                if not token_id:
+                    continue
 
                 try:
                     book = client.get_order_book(token_id)
-                except Exception:
+                except Exception as exc:
+                    print(f"Failed to fetch order book for token {token_id}: {exc}")
                     continue
 
-                best_bid = to_float(book.best_bid)
-                best_ask = to_float(book.best_ask)
-                bid_size = to_float(book.bid_size)
-                ask_size = to_float(book.ask_size)
-                liquidity = bid_size + ask_size
-
-                if not has_valid_book(best_bid, best_ask):
-                    continue
-
-                valid_books += 1
-
-                item = {
-                    "question": question,
-                    "label": label,
-                    "token_id": token_id,
-                    "best_bid": best_bid,
-                    "best_ask": best_ask,
-                    "spread": best_ask - best_bid,
-                    "bid_size": bid_size,
-                    "ask_size": ask_size,
-                    "liquidity": liquidity,
-                    "score": score_market(best_bid, best_ask, liquidity),
-                }
-
-                all_results.append(item)
-
-                if is_interesting(best_bid, best_ask, liquidity):
-                    filtered_results.append(item)
+                item = build_scanned_market(market=market, token=token, book=book)
+                if item is not None:
+                    scanned.append(item)
 
         if not next_cursor or next_cursor == cursor:
             break
 
         cursor = next_cursor
 
-        # parar cedo se já encontrámos suficientes
-        if len(filtered_results) >= 10:
-            break
+    scanned.sort(key=lambda x: x.total_score, reverse=True)
+    return scanned
 
-    filtered_results.sort(key=lambda x: x["score"], reverse=True)
-    by_liquidity = sorted(all_results, key=lambda x: x["liquidity"], reverse=True)
-    by_spread = sorted(all_results, key=lambda x: x["spread"])
+
+def main() -> None:
+    OUTPUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+
+    client = PolymarketClient()
+
+    print("Fetching BTC-focused tradeable markets...")
+    results = fetch_tradeable_btc_markets(client=client, max_pages=10)
 
     print()
     print("SUMMARY")
     print("=" * 80)
-    print(f"Pages scanned     : {pages_scanned}")
-    print(f"Markets scanned   : {markets_scanned}")
-    print(f"Tradeable markets : {tradeable_markets}")
-    print(f"Tokens scanned    : {tokens_scanned}")
-    print(f"Valid books       : {valid_books}")
-    print(f"Passed filters    : {len(filtered_results)}")
+    print(f"BTC markets kept : {len(results)}")
+
+    for idx, market in enumerate(results[:15], start=1):
+        print(
+            f"{idx:02d}. score={market.total_score:.4f} | "
+            f"side={market.side:>3} | "
+            f"mid={market.midpoint} | "
+            f"spread={market.spread} | "
+            f"liq={market.liquidity} | "
+            f"days={market.days_to_resolution:.1f} | "
+            f"{market.question}"
+        )
+
+    with OUTPUT_JSON.open("w", encoding="utf-8") as f:
+        json.dump([asdict(item) for item in results], f, ensure_ascii=False, indent=2)
 
     print()
-    print("TOP 10 FILTERED MARKETS")
-    print("=" * 80)
-    if filtered_results:
-        for i, item in enumerate(filtered_results[:10], start=1):
-            print_market_block(i, item)
-    else:
-        print("No interesting markets found with current filters.")
-        print("-" * 80)
-
-    print()
-    print("TOP 10 BY LIQUIDITY")
-    print("=" * 80)
-    if by_liquidity:
-        for i, item in enumerate(by_liquidity[:10], start=1):
-            print_market_block(i, item)
-    else:
-        print("No markets with valid order book found.")
-        print("-" * 80)
-
-    print()
-    print("TOP 10 BY LOWEST SPREAD")
-    print("=" * 80)
-    if by_spread:
-        for i, item in enumerate(by_spread[:10], start=1):
-            print_market_block(i, item)
-    else:
-        print("No markets with valid order book found.")
-        print("-" * 80)
+    print(f"Saved results to: {OUTPUT_JSON}")
 
 
 if __name__ == "__main__":

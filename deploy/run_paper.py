@@ -4,7 +4,7 @@ import json
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -41,10 +41,34 @@ from strategies.rsi_vwap import RsiVwapStrategy
 LOGS_DIR = PROJECT_ROOT / "logs"
 TOKEN_ANALYSIS_JSON = PROJECT_ROOT / "token_analysis_results.json"
 GAMMA_FILTERED_JSON = PROJECT_ROOT / "gamma_scan_results_filtered.json"
+WATCH_STATE_PATH = LOGS_DIR / "watch_state.json"
 
 MIN_API_HISTORY_POINTS = 20
 API_HISTORY_FIDELITY = 5
 TOKEN_ANALYSIS_MAX_AGE_SECONDS = 300
+
+BTC_KEYWORDS = [
+    "bitcoin",
+    "btc",
+    "xbt",
+    "satoshi",
+    "ath",
+    "all time high",
+]
+
+NEW_ENTRY_MIN_DAYS = 15.0
+NEW_ENTRY_MAX_DAYS = 60.0
+FORCE_EXIT_DAYS = 7.0
+MAX_SWITCH_SCORE_RATIO = 1.25
+
+
+@dataclass
+class WatchState:
+    watched_token_id: str = ""
+    watched_market_name: str = ""
+    watched_outcome: str = ""
+    watched_score: float = 0.0
+    updated_at: str = ""
 
 
 @dataclass
@@ -58,6 +82,12 @@ class CandidateToken:
     return_pct: float
     trend_consistency: float
     history_points: int
+    end_date: str = ""
+    days_to_resolution: float = 9999.0
+    liquidity: float = 0.0
+    volume: float = 0.0
+    btc_relevance_score: float = 0.0
+    final_score: float = 0.0
 
 
 def get_strategies() -> dict:
@@ -163,6 +193,150 @@ def safe_float(value, default: float = 0.0) -> float:
         return float(value)
     except Exception:
         return default
+
+
+def parse_iso_datetime(raw_value: str) -> Optional[datetime]:
+    text = str(raw_value or "").strip()
+    if not text:
+        return None
+
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def compute_days_to_resolution(raw_end_date: str) -> float:
+    parsed = parse_iso_datetime(raw_end_date)
+    if parsed is None:
+        return 9999.0
+
+    now = datetime.now(timezone.utc)
+    return (parsed - now).total_seconds() / 86400.0
+
+
+def is_btc_market_name(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    return any(keyword in normalized for keyword in BTC_KEYWORDS)
+
+
+def compute_btc_relevance_score(market_name: str) -> float:
+    normalized = str(market_name or "").strip().lower()
+    if not normalized:
+        return 0.0
+
+    score = 0.0
+
+    if "bitcoin" in normalized:
+        score += 0.50
+    if "btc" in normalized:
+        score += 0.40
+    if "ath" in normalized or "all time high" in normalized:
+        score += 0.15
+    if "above" in normalized or "below" in normalized:
+        score += 0.10
+    if "reach" in normalized or "hit" in normalized:
+        score += 0.10
+    if "price" in normalized or "$" in normalized:
+        score += 0.10
+
+    return min(score, 1.0)
+
+
+def compute_time_score(days_to_resolution: float) -> float:
+    if NEW_ENTRY_MIN_DAYS <= days_to_resolution <= 45:
+        return 1.0
+    if 45 < days_to_resolution <= NEW_ENTRY_MAX_DAYS:
+        return 0.8
+    if FORCE_EXIT_DAYS < days_to_resolution < NEW_ENTRY_MIN_DAYS:
+        return 0.4
+    return 0.0
+
+
+def compute_price_zone_score(midpoint: float) -> float:
+    if 0.35 <= midpoint <= 0.80:
+        return 1.0
+    if 0.20 <= midpoint < 0.35:
+        return 0.7
+    if 0.80 < midpoint <= 0.90:
+        return 0.5
+    if 0.10 <= midpoint < 0.20:
+        return 0.2
+    return 0.0
+
+
+def compute_spread_score(spread: float) -> float:
+    if spread <= 0:
+        return 0.0
+    if spread <= 0.01:
+        return 1.0
+    if spread <= 0.02:
+        return 0.8
+    if spread <= 0.03:
+        return 0.5
+    if spread <= 0.05:
+        return 0.2
+    return 0.0
+
+
+def compute_liquidity_score(liquidity: float, volume: float) -> float:
+    liquidity_score = min(max(liquidity / 10000.0, 0.0), 1.0)
+    volume_score = min(max(volume / 10000.0, 0.0), 1.0)
+    return (liquidity_score * 0.7) + (volume_score * 0.3)
+
+
+def compute_candidate_final_score(candidate: CandidateToken) -> float:
+    time_score = compute_time_score(candidate.days_to_resolution)
+    price_score = compute_price_zone_score(candidate.midpoint)
+    spread_score = compute_spread_score(candidate.spread)
+    liquidity_score = compute_liquidity_score(candidate.liquidity, candidate.volume)
+    btc_score = candidate.btc_relevance_score
+
+    base_json_score = max(candidate.score, 0.0)
+    normalized_json_score = min(base_json_score / 100.0, 1.0) if base_json_score > 1 else min(base_json_score, 1.0)
+
+    outcome_bias_penalty = 0.03 if candidate.outcome == "YES" and candidate.days_to_resolution >= NEW_ENTRY_MIN_DAYS else 0.0
+
+    final_score = (
+        btc_score * 0.20
+        + time_score * 0.20
+        + spread_score * 0.15
+        + price_score * 0.15
+        + liquidity_score * 0.10
+        + normalized_json_score * 0.10
+        + max(candidate.trend_consistency, 0.0) * 0.05
+        + min(max(candidate.return_pct / 20.0, 0.0), 1.0) * 0.05
+    ) - outcome_bias_penalty
+
+    return round(max(final_score, 0.0), 6)
+
+
+def load_watch_state(path: Path = WATCH_STATE_PATH) -> WatchState:
+    if not path.exists():
+        return WatchState()
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return WatchState(
+            watched_token_id=str(data.get("watched_token_id", "") or ""),
+            watched_market_name=str(data.get("watched_market_name", "") or ""),
+            watched_outcome=str(data.get("watched_outcome", "") or ""),
+            watched_score=float(data.get("watched_score", 0.0) or 0.0),
+            updated_at=str(data.get("updated_at", "") or ""),
+        )
+    except Exception:
+        return WatchState()
+
+
+def save_watch_state(state: WatchState, path: Path = WATCH_STATE_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(state), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def clear_watch_state(path: Path = WATCH_STATE_PATH) -> None:
+    save_watch_state(WatchState(), path=path)
 
 
 def split_position_key(raw_key: str) -> tuple[str, str]:
@@ -391,25 +565,44 @@ def load_candidates_from_json(max_candidates: int = 10) -> list[CandidateToken]:
             )
 
             outcome = str(item.get("outcome", "") or "").strip().upper()
-
-            candidates.append(
-                CandidateToken(
-                    token_id=token_id,
-                    market_name=str(market_name),
-                    outcome=outcome,
-                    score=safe_float(item.get("score"), 0.0),
-                    midpoint=safe_float(item.get("midpoint"), 0.0),
-                    spread=safe_float(item.get("spread"), 0.0),
-                    return_pct=safe_float(item.get("return_pct"), 0.0),
-                    trend_consistency=safe_float(item.get("trend_consistency"), 0.0),
-                    history_points=int(item.get("history_points", 0) or 0),
-                )
+            end_date = (
+                item.get("end_date")
+                or item.get("endDate")
+                or item.get("end_date_iso")
+                or item.get("resolve_date")
+                or ""
             )
+
+            liquidity = safe_float(item.get("liquidity"), 0.0)
+            volume = safe_float(item.get("volume"), 0.0)
+            days_to_resolution = compute_days_to_resolution(end_date)
+            btc_relevance_score = compute_btc_relevance_score(str(market_name))
+
+            candidate = CandidateToken(
+                token_id=token_id,
+                market_name=str(market_name),
+                outcome=outcome,
+                score=safe_float(item.get("score"), 0.0),
+                midpoint=safe_float(item.get("midpoint"), 0.0),
+                spread=safe_float(item.get("spread"), 0.0),
+                return_pct=safe_float(item.get("return_pct"), 0.0),
+                trend_consistency=safe_float(item.get("trend_consistency"), 0.0),
+                history_points=int(item.get("history_points", 0) or 0),
+                end_date=str(end_date or ""),
+                days_to_resolution=days_to_resolution,
+                liquidity=liquidity,
+                volume=volume,
+                btc_relevance_score=btc_relevance_score,
+                final_score=0.0,
+            )
+            candidate.final_score = compute_candidate_final_score(candidate)
+            candidates.append(candidate)
+
         except Exception as exc:
             failed += 1
             print(f"WARNING: candidate {idx} inválido: {exc}")
 
-    candidates.sort(key=lambda x: x.score, reverse=True)
+    candidates.sort(key=lambda x: x.final_score, reverse=True)
 
     print(f"Parsed candidates      : {len(candidates)}")
     print(f"Failed candidates      : {failed}")
@@ -421,6 +614,15 @@ def load_candidates_from_json(max_candidates: int = 10) -> list[CandidateToken]:
 
 
 def basic_buy_candidate_filter(candidate: CandidateToken) -> tuple[bool, str]:
+    if not is_btc_market_name(candidate.market_name):
+        return False, "not_btc_market"
+
+    if candidate.days_to_resolution < NEW_ENTRY_MIN_DAYS:
+        return False, "too_close_to_resolution"
+
+    if candidate.days_to_resolution > NEW_ENTRY_MAX_DAYS:
+        return False, "too_far_from_resolution"
+
     if candidate.midpoint <= 0:
         return False, "missing_midpoint"
 
@@ -442,7 +644,38 @@ def basic_buy_candidate_filter(candidate: CandidateToken) -> tuple[bool, str]:
     if candidate.trend_consistency > 0 and candidate.trend_consistency < 0.40:
         return False, "trend_consistency_too_low"
 
+    if candidate.final_score <= 0:
+        return False, "final_score_too_low"
+
     return True, "candidate_ok"
+
+
+def is_candidate_still_watchable(candidate: Optional[CandidateToken]) -> tuple[bool, str]:
+    if candidate is None:
+        return False, "missing_candidate"
+
+    if not is_btc_market_name(candidate.market_name):
+        return False, "not_btc_market"
+
+    if candidate.days_to_resolution <= FORCE_EXIT_DAYS:
+        return False, "too_close_to_resolution"
+
+    if candidate.days_to_resolution > NEW_ENTRY_MAX_DAYS:
+        return False, "too_far_from_resolution"
+
+    if candidate.midpoint <= 0:
+        return False, "missing_midpoint"
+
+    if candidate.midpoint < 0.10 or candidate.midpoint > 0.90:
+        return False, "midpoint_outside_range"
+
+    if candidate.spread <= 0 or candidate.spread > 0.02:
+        return False, "spread_invalid"
+
+    if candidate.final_score <= 0:
+        return False, "score_too_low"
+
+    return True, "watchable"
 
 
 def resolve_open_position_token_id(portfolio) -> Optional[str]:
@@ -489,6 +722,67 @@ def build_trader(config: AppConfig, client: PolymarketClient) -> Trader:
         strategies=get_strategies(),
         execution_engine=execution_engine,
     )
+
+
+def find_candidate_by_token_id(token_id: str, candidates: list[CandidateToken]) -> Optional[CandidateToken]:
+    for candidate in candidates:
+        if candidate.token_id == token_id:
+            return candidate
+    return None
+
+
+def choose_watched_candidate(
+    *,
+    watch_state: WatchState,
+    candidates: list[CandidateToken],
+) -> tuple[Optional[CandidateToken], WatchState, str]:
+    if not candidates:
+        new_state = WatchState()
+        return None, new_state, "no_candidates"
+
+    best_candidate = candidates[0]
+    watched_candidate = find_candidate_by_token_id(watch_state.watched_token_id, candidates)
+
+    if watched_candidate is None:
+        new_state = WatchState(
+            watched_token_id=best_candidate.token_id,
+            watched_market_name=best_candidate.market_name,
+            watched_outcome=best_candidate.outcome,
+            watched_score=best_candidate.final_score,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return best_candidate, new_state, "watch_initialized"
+
+    still_watchable, reason = is_candidate_still_watchable(watched_candidate)
+    if not still_watchable:
+        new_state = WatchState(
+            watched_token_id=best_candidate.token_id,
+            watched_market_name=best_candidate.market_name,
+            watched_outcome=best_candidate.outcome,
+            watched_score=best_candidate.final_score,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        return best_candidate, new_state, f"watch_replaced_{reason}"
+
+    if best_candidate.token_id != watched_candidate.token_id:
+        if best_candidate.final_score >= watched_candidate.final_score * MAX_SWITCH_SCORE_RATIO:
+            new_state = WatchState(
+                watched_token_id=best_candidate.token_id,
+                watched_market_name=best_candidate.market_name,
+                watched_outcome=best_candidate.outcome,
+                watched_score=best_candidate.final_score,
+                updated_at=datetime.now(timezone.utc).isoformat(),
+            )
+            return best_candidate, new_state, "watch_switched_better_candidate"
+
+    new_state = WatchState(
+        watched_token_id=watched_candidate.token_id,
+        watched_market_name=watched_candidate.market_name,
+        watched_outcome=watched_candidate.outcome,
+        watched_score=watched_candidate.final_score,
+        updated_at=datetime.now(timezone.utc).isoformat(),
+    )
+    return watched_candidate, new_state, "watch_kept"
 
 
 def evaluate_token(
@@ -599,6 +893,46 @@ def evaluate_token(
     }
 
 
+def maybe_force_exit_near_resolution(
+    result,
+    candidate: Optional[CandidateToken],
+    current_open_side: str,
+):
+    if result is None or candidate is None:
+        return result
+
+    if candidate.days_to_resolution > FORCE_EXIT_DAYS:
+        return result
+
+    metadata = dict(getattr(result, "metadata", {}) or {})
+    existing_signal = getattr(result, "signal", None)
+
+    if existing_signal and getattr(existing_signal, "value", "") == "SELL":
+        return result
+
+    metadata["position_side"] = current_open_side or metadata.get("position_side", "")
+    metadata["side"] = current_open_side or metadata.get("side", "")
+    metadata["forced_exit"] = True
+    metadata["days_to_resolution"] = candidate.days_to_resolution
+
+    result.signal = type(result.signal).SELL
+    result.reason = f"force_exit_near_resolution({candidate.days_to_resolution:.2f}d)"
+    result.metadata = metadata
+
+    print("FORCED EXIT           : True")
+    print(f"Force exit reason     : near resolution ({candidate.days_to_resolution:.2f} days)")
+    print()
+
+    return result
+
+
+def print_portfolio_snapshot(portfolio_snapshot: dict) -> None:
+    print("Portfolio")
+    print("---------")
+    for key, value in portfolio_snapshot.items():
+        print(f"{key}: {value}")
+
+
 def main() -> None:
     config = load_config()
 
@@ -614,6 +948,7 @@ def main() -> None:
 
     portfolio_snapshot_before = portfolio.snapshot()
     position_state = build_position_sizing_state(portfolio_snapshot_before)
+    watch_state = load_watch_state()
 
     print(f"Mode                 : {config.trading.trading_mode}")
     print(f"Dry run              : {config.trading.dry_run}")
@@ -629,32 +964,41 @@ def main() -> None:
 
     client = PolymarketClient(config.polymarket)
 
+    all_candidates = load_candidates_from_json(max_candidates=20)
     current_open_token_id = resolve_open_position_token_id(portfolio)
     current_open_side = resolve_open_position_side(portfolio, current_open_token_id) if current_open_token_id else ""
+    current_open_candidate = find_candidate_by_token_id(current_open_token_id, all_candidates) if current_open_token_id else None
 
     selected_token_id: Optional[str] = None
     selected_market_name: str = ""
     selected_outcome: str = ""
     selected_evaluation: Optional[dict] = None
+    selected_candidate: Optional[CandidateToken] = None
 
     if current_open_token_id:
+        clear_watch_state()
+
         selected_token_id = current_open_token_id
-        selected_market_name = current_open_token_id
-        selected_outcome = current_open_side or ""
+        selected_market_name = current_open_candidate.market_name if current_open_candidate else current_open_token_id
+        selected_outcome = current_open_side or (current_open_candidate.outcome if current_open_candidate else "")
+        selected_candidate = current_open_candidate
+
         print("Open position detected. Managing current position.")
         print(f"Token ID             : {selected_token_id}")
+        if current_open_candidate is not None:
+            print(f"Market               : {current_open_candidate.market_name} [{current_open_candidate.outcome}]")
+            print(f"Days to resolution   : {current_open_candidate.days_to_resolution:.2f}")
+            print(f"BTC relevance score  : {current_open_candidate.btc_relevance_score}")
+            print(f"Final score          : {current_open_candidate.final_score}")
         print()
     else:
-        candidates = load_candidates_from_json(max_candidates=10)
+        candidates = all_candidates[:10]
 
         if not candidates:
             if not config.trading.default_token_id:
                 print("Nenhum candidato válido no JSON e DEFAULT_TOKEN_ID está vazio.")
                 print()
-                print("Portfolio")
-                print("---------")
-                for key, value in portfolio_snapshot_before.items():
-                    print(f"{key}: {value}")
+                print_portfolio_snapshot(portfolio_snapshot_before)
                 return
 
             print("Sem candidatos no JSON. A usar DEFAULT_TOKEN_ID como fallback.")
@@ -663,97 +1007,80 @@ def main() -> None:
             selected_market_name = selected_token_id
             selected_outcome = ""
         else:
-            print("Candidate evaluation")
-            print("--------------------")
+            print("Watch candidate selection")
+            print("-------------------------")
 
-            selected_evaluation = None
-            first_eligible_evaluation = None
+            watched_candidate, new_watch_state, watch_reason = choose_watched_candidate(
+                watch_state=watch_state,
+                candidates=candidates,
+            )
+            save_watch_state(new_watch_state)
 
-            for idx, candidate in enumerate(candidates, start=1):
-                passes_candidate_filter, candidate_reason = basic_buy_candidate_filter(candidate)
-
-                print(f"[{idx}] {candidate.market_name} [{candidate.outcome}]")
-                print(f"    Token ID         : {candidate.token_id}")
-                print(f"    Score            : {candidate.score}")
-                print(f"    Midpoint         : {candidate.midpoint}")
-                print(f"    Spread           : {candidate.spread}")
-                print(f"    Return %         : {candidate.return_pct}")
-                print(f"    Trend consistency: {candidate.trend_consistency}")
-                print(f"    History points   : {candidate.history_points}")
-                print(f"    Candidate filter : {passes_candidate_filter} ({candidate_reason})")
-
-                if not passes_candidate_filter:
-                    print()
-                    continue
-
-                evaluation = evaluate_token(
-                    config=config,
-                    client=client,
-                    token_id=candidate.token_id,
-                    market_name=candidate.market_name,
-                    outcome=candidate.outcome,
-                    position_sizer=position_sizer,
-                    position_state=position_state,
-                )
-
-                if first_eligible_evaluation is None:
-                    first_eligible_evaluation = evaluation
-
-                result = evaluation["result"]
-                book = evaluation["book"]
-                spread = evaluation["spread"]
-                last_trade = evaluation["last_trade"]
-
-                print(f"    Live best_bid    : {book.best_bid}")
-                print(f"    Live best_ask    : {book.best_ask}")
-                print(f"    Live bid_size    : {book.bid_size}")
-                print(f"    Live ask_size    : {book.ask_size}")
-                print(f"    Live spread      : {spread}")
-                print(f"    Last trade px    : {last_trade['price']}")
-                print(f"    Last trade side  : {last_trade['side']}")
-                print(f"    History source   : {evaluation['history_source']}")
-                print(f"    API hist points  : {evaluation['api_history_points']}")
-                print(f"    API hist enough  : {evaluation['api_history_enough']}")
-                print(f"    API fidelity     : {evaluation['api_history_fidelity']}")
-                print(f"    History file     : {evaluation['history_path'].name}")
-                print(f"    Calc order size  : {evaluation['calculated_order_size']}")
-
-                if result is None:
-                    print("    Strategy result  : None")
-                    print()
-                    continue
-
-                print(f"    Strategy result  : {result}")
-                print()
-
-                if result.signal.value == "BUY":
-                    selected_evaluation = evaluation
-                    break
-
-            if selected_evaluation is None:
-                if first_eligible_evaluation is not None:
-                    selected_evaluation = first_eligible_evaluation
-                    print("Nenhum candidato deu sinal BUY imediato.")
-                    print("A usar o primeiro candidato elegível da lista como fallback.")
-                    print()
-                else:
-                    print("Nenhum candidato elegível encontrado neste ciclo.")
-                    print()
-                    print("Portfolio")
-                    print("---------")
-                    for key, value in portfolio_snapshot_before.items():
-                        print(f"{key}: {value}")
-                    return
-
-            selected_token_id = selected_evaluation["token_id"]
-            selected_market_name = selected_evaluation["market_name"]
-            selected_outcome = selected_evaluation["outcome"]
-
-            print("Selected candidate")
-            print("------------------")
-            print(f"Market              : {selected_market_name} [{selected_outcome}]")
-            print(f"Token ID            : {selected_token_id}")
+            print(f"Watch decision       : {watch_reason}")
+            print(f"Watched token ID     : {new_watch_state.watched_token_id}")
+            print(f"Watched market       : {new_watch_state.watched_market_name}")
+            print(f"Watched outcome      : {new_watch_state.watched_outcome}")
+            print(f"Watched score        : {new_watch_state.watched_score}")
             print()
+
+            if watched_candidate is None:
+                print("Nenhum mercado observável encontrado neste ciclo.")
+                print_portfolio_snapshot(portfolio_snapshot_before)
+                return
+
+            selected_candidate = watched_candidate
+
+            selected_evaluation = evaluate_token(
+                config=config,
+                client=client,
+                token_id=selected_candidate.token_id,
+                market_name=selected_candidate.market_name,
+                outcome=selected_candidate.outcome,
+                position_sizer=position_sizer,
+                position_state=position_state,
+            )
+
+            result = selected_evaluation["result"]
+            book = selected_evaluation["book"]
+            spread = selected_evaluation["spread"]
+            last_trade = selected_evaluation["last_trade"]
+
+            print("Watched market evaluation")
+            print("-------------------------")
+            print(f"Market               : {selected_candidate.market_name} [{selected_candidate.outcome}]")
+            print(f"Token ID             : {selected_candidate.token_id}")
+            print(f"Final score          : {selected_candidate.final_score}")
+            print(f"Days to resolution   : {selected_candidate.days_to_resolution:.2f}")
+            print(f"Midpoint             : {selected_candidate.midpoint}")
+            print(f"Spread               : {selected_candidate.spread}")
+            print(f"Live best_bid        : {book.best_bid}")
+            print(f"Live best_ask        : {book.best_ask}")
+            print(f"Live spread          : {spread}")
+            print(f"Last trade px        : {last_trade['price']}")
+            print(f"Last trade side      : {last_trade['side']}")
+            print(f"History source       : {selected_evaluation['history_source']}")
+            print(f"API hist points      : {selected_evaluation['api_history_points']}")
+            print(f"API hist enough      : {selected_evaluation['api_history_enough']}")
+            print(f"API fidelity         : {selected_evaluation['api_history_fidelity']}")
+            print(f"History file         : {selected_evaluation['history_path'].name}")
+            print(f"Calc order size      : {selected_evaluation['calculated_order_size']}")
+            print(f"Strategy result      : {result}")
+            print()
+
+            if result is None:
+                print("Sem resultado da estratégia neste ciclo.")
+                print_portfolio_snapshot(portfolio_snapshot_before)
+                return
+
+            if result.signal.value != "BUY":
+                print("Mercado observado continua em espera. Ainda sem BUY.")
+                print()
+                print_portfolio_snapshot(portfolio_snapshot_before)
+                return
+
+            selected_token_id = selected_candidate.token_id
+            selected_market_name = selected_candidate.market_name
+            selected_outcome = selected_candidate.outcome
 
     if not selected_token_id:
         print("No token selected.")
@@ -778,6 +1105,13 @@ def main() -> None:
     result = final_evaluation["result"]
     midpoint = final_evaluation["midpoint"]
     trader_for_final = final_evaluation["trader"]
+
+    if current_open_token_id and selected_candidate is not None:
+        result = maybe_force_exit_near_resolution(
+            result=result,
+            candidate=selected_candidate,
+            current_open_side=current_open_side,
+        )
 
     print(f"spread   : {spread}")
     print(f"last_px  : {last_trade['price']}")
@@ -811,10 +1145,7 @@ def main() -> None:
     if calculated_order_size <= 0:
         print("Calculated order size is 0. No available exposure for a new trade.")
         print()
-        print("Portfolio")
-        print("---------")
-        for key, value in portfolio_snapshot_before.items():
-            print(f"{key}: {value}")
+        print_portfolio_snapshot(portfolio_snapshot_before)
         return
 
     print(f"Calculated order size: {calculated_order_size}")
@@ -853,6 +1184,9 @@ def main() -> None:
             size=order_size,
             price=limit_price,
         )
+
+        if result and result.signal.value == "BUY":
+            clear_watch_state()
 
     if position_side and midpoint > 0:
         portfolio.mark_position(
@@ -994,10 +1328,7 @@ def main() -> None:
     )
 
     print()
-    print("Portfolio")
-    print("---------")
-    for key, value in portfolio_snapshot.items():
-        print(f"{key}: {value}")
+    print_portfolio_snapshot(portfolio_snapshot)
 
 
 if __name__ == "__main__":

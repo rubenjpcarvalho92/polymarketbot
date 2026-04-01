@@ -7,6 +7,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -16,6 +17,19 @@ import requests
 CLOB_BASE_URL = "https://clob.polymarket.com"
 INPUT_JSON = "gamma_scan_results_filtered.json"
 OUTPUT_JSON = "token_analysis_results.json"
+
+BTC_KEYWORDS = [
+    "bitcoin",
+    "btc",
+    "xbt",
+    "satoshi",
+    "ath",
+    "all time high",
+]
+
+NEW_ENTRY_MIN_DAYS = 15.0
+NEW_ENTRY_MAX_DAYS = 60.0
+FORCE_EXIT_DAYS = 7.0
 
 
 @dataclass
@@ -27,6 +41,12 @@ class TokenAnalysis:
 
     outcome: str
     token_id: str
+
+    end_date: Optional[str]
+    days_to_resolution: Optional[float]
+    liquidity: Optional[float]
+    volume: Optional[float]
+    btc_relevance_score: float
 
     midpoint: Optional[float]
     buy_price: Optional[float]   # best ask: price to buy
@@ -51,6 +71,9 @@ class TokenAnalysis:
 
     midpoint_penalty: float
     spread_penalty: float
+    time_penalty: float
+    btc_bonus: float
+    liquidity_bonus: float
     score: float
     ranking_reason: Dict[str, Any]
 
@@ -63,7 +86,7 @@ class ClobAnalyzer:
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "clob-market-analyzer-standalone/5.0-buy-oriented",
+                "User-Agent": "clob-market-analyzer-standalone/6.0-btc-focused",
             }
         )
         self.exclusion_reasons: Counter[str] = Counter()
@@ -82,6 +105,76 @@ class ClobAnalyzer:
             return float(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _parse_iso_datetime(raw_value: Any) -> Optional[datetime]:
+        text = str(raw_value or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except Exception:
+            return None
+
+    @classmethod
+    def _compute_days_to_resolution(cls, end_date: Any) -> Optional[float]:
+        parsed = cls._parse_iso_datetime(end_date)
+        if parsed is None:
+            return None
+        now = datetime.now(timezone.utc)
+        return (parsed - now).total_seconds() / 86400.0
+
+    @staticmethod
+    def _is_btc_market_text(question: Optional[str], event_title: Optional[str]) -> bool:
+        text = f"{question or ''} {event_title or ''}".strip().lower()
+        if not text:
+            return False
+        return any(keyword in text for keyword in BTC_KEYWORDS)
+
+    @staticmethod
+    def _compute_btc_relevance_score(question: Optional[str], event_title: Optional[str]) -> float:
+        text = f"{question or ''} {event_title or ''}".strip().lower()
+        if not text:
+            return 0.0
+
+        score = 0.0
+
+        if "bitcoin" in text:
+            score += 0.50
+        if "btc" in text:
+            score += 0.40
+        if "ath" in text or "all time high" in text:
+            score += 0.15
+        if "above" in text or "below" in text:
+            score += 0.10
+        if "reach" in text or "hit" in text:
+            score += 0.10
+        if "price" in text or "$" in text:
+            score += 0.10
+
+        return min(score, 1.0)
+
+    @staticmethod
+    def _compute_time_penalty(days_to_resolution: Optional[float]) -> float:
+        if days_to_resolution is None:
+            return 3.0
+        if days_to_resolution <= FORCE_EXIT_DAYS:
+            return 3.0
+        if days_to_resolution < NEW_ENTRY_MIN_DAYS:
+            return 2.0
+        if days_to_resolution > NEW_ENTRY_MAX_DAYS:
+            return 1.5
+        return 0.0
+
+    @staticmethod
+    def _compute_liquidity_bonus(liquidity: Optional[float], volume: Optional[float]) -> float:
+        liq = liquidity or 0.0
+        vol = volume or 0.0
+
+        liq_score = min(max(liq / 10000.0, 0.0), 1.0)
+        vol_score = min(max(vol / 10000.0, 0.0), 1.0)
+
+        return (liq_score * 1.5) + (vol_score * 0.75)
 
     def get_midpoint(self, token_id: str) -> Optional[float]:
         data = self._get("/midpoint", {"token_id": token_id})
@@ -246,6 +339,8 @@ class ClobAnalyzer:
 
     @staticmethod
     def _is_eligible(
+        *,
+        is_btc_market: bool,
         midpoint: Optional[float],
         spread: Optional[float],
         history_points: int,
@@ -253,7 +348,23 @@ class ClobAnalyzer:
         avg_abs_change: Optional[float],
         return_pct: Optional[float],
         trend_consistency: Optional[float],
+        days_to_resolution: Optional[float],
     ) -> tuple[bool, str]:
+        if not is_btc_market:
+            return False, "not_btc_market"
+
+        if days_to_resolution is None:
+            return False, "missing_end_date"
+
+        if days_to_resolution <= FORCE_EXIT_DAYS:
+            return False, "too_close_to_resolution"
+
+        if days_to_resolution < NEW_ENTRY_MIN_DAYS:
+            return False, "below_entry_window"
+
+        if days_to_resolution > NEW_ENTRY_MAX_DAYS:
+            return False, "above_entry_window"
+
         if midpoint is None:
             return False, "missing_midpoint"
 
@@ -278,7 +389,7 @@ class ClobAnalyzer:
         if return_pct is None:
             return False, "missing_return"
 
-        if return_pct is not None and return_pct < -5 :
+        if return_pct < -5:
             return False, "not_buy_trending"
 
         if trend_consistency is None or trend_consistency < 0.35:
@@ -291,6 +402,7 @@ class ClobAnalyzer:
 
     @staticmethod
     def _score(
+        *,
         midpoint: Optional[float],
         buy_price: Optional[float],
         sell_price: Optional[float],
@@ -301,7 +413,12 @@ class ClobAnalyzer:
         volatility: Optional[float],
         avg_abs_change: Optional[float],
         trend_consistency: Optional[float],
-    ) -> Tuple[float, float, float, float, float, float]:
+        days_to_resolution: Optional[float],
+        btc_relevance_score: float,
+        liquidity: Optional[float],
+        volume: Optional[float],
+        outcome: str,
+    ) -> Tuple[float, float, float, float, float, float, float, float, float]:
         history_term = math.log1p(max(history_points, 0))
         capped_return = min(return_pct, 25.0) if return_pct is not None else 0.0
         vol_term = volatility or 0.0
@@ -322,6 +439,11 @@ class ClobAnalyzer:
         )
         positive_return_bonus = ClobAnalyzer._positive_return_bonus(return_pct)
         trend_bonus = ClobAnalyzer._trend_bonus(trend_consistency)
+        time_penalty = ClobAnalyzer._compute_time_penalty(days_to_resolution)
+        btc_bonus = btc_relevance_score * 2.0
+        liquidity_bonus = ClobAnalyzer._compute_liquidity_bonus(liquidity, volume)
+
+        yes_bias_penalty = 0.03 if outcome.upper() == "YES" and (days_to_resolution or 0) >= NEW_ENTRY_MIN_DAYS else 0.0
 
         raw_score = (
             1.6 * history_term
@@ -333,9 +455,13 @@ class ClobAnalyzer:
             + price_bonus
             + positive_return_bonus
             + trend_bonus
+            + btc_bonus
+            + liquidity_bonus
             - midpoint_penalty
             - spread_penalty
             - pump_penalty
+            - time_penalty
+            - yes_bias_penalty
         )
 
         return (
@@ -345,6 +471,9 @@ class ClobAnalyzer:
             pump_penalty,
             positive_return_bonus,
             trend_bonus,
+            time_penalty,
+            btc_bonus,
+            liquidity_bonus,
         )
 
     def analyze_token(
@@ -355,6 +484,9 @@ class ClobAnalyzer:
         parent_question: Optional[str],
         parent_event_title: Optional[str],
         parent_url: Optional[str],
+        parent_end_date: Optional[str],
+        parent_liquidity: Optional[float],
+        parent_volume: Optional[float],
         interval: str,
         fidelity: int,
     ) -> Optional[TokenAnalysis]:
@@ -365,6 +497,10 @@ class ClobAnalyzer:
         last_trade_price = None
         last_trade_side = None
         history: List[Dict[str, Any]] = []
+
+        days_to_resolution = self._compute_days_to_resolution(parent_end_date)
+        is_btc_market = self._is_btc_market_text(parent_question, parent_event_title)
+        btc_relevance_score = self._compute_btc_relevance_score(parent_question, parent_event_title)
 
         try:
             midpoint = self.get_midpoint(token_id)
@@ -415,6 +551,7 @@ class ClobAnalyzer:
         history_points = len(prices)
 
         eligible, eligibility_reason = self._is_eligible(
+            is_btc_market=is_btc_market,
             midpoint=midpoint,
             spread=spread,
             history_points=history_points,
@@ -422,6 +559,7 @@ class ClobAnalyzer:
             avg_abs_change=metrics["avg_abs_change"],
             return_pct=metrics["return_pct"],
             trend_consistency=metrics["trend_consistency"],
+            days_to_resolution=days_to_resolution,
         )
 
         if not eligible:
@@ -435,6 +573,9 @@ class ClobAnalyzer:
             pump_penalty,
             positive_return_bonus,
             trend_bonus,
+            time_penalty,
+            btc_bonus,
+            liquidity_bonus,
         ) = self._score(
             midpoint=midpoint,
             buy_price=buy_price,
@@ -446,11 +587,21 @@ class ClobAnalyzer:
             volatility=metrics["volatility"],
             avg_abs_change=metrics["avg_abs_change"],
             trend_consistency=metrics["trend_consistency"],
+            days_to_resolution=days_to_resolution,
+            btc_relevance_score=btc_relevance_score,
+            liquidity=parent_liquidity,
+            volume=parent_volume,
+            outcome=outcome,
         )
 
         ranking_reason = {
             "eligibility_reason": eligibility_reason,
             "history_points": history_points,
+            "end_date": parent_end_date,
+            "days_to_resolution": days_to_resolution,
+            "liquidity": parent_liquidity,
+            "volume": parent_volume,
+            "btc_relevance_score": btc_relevance_score,
             "midpoint": midpoint,
             "buy_price": buy_price,
             "sell_price": sell_price,
@@ -465,6 +616,9 @@ class ClobAnalyzer:
             "pump_penalty": pump_penalty,
             "positive_return_bonus": positive_return_bonus,
             "trend_bonus": trend_bonus,
+            "time_penalty": time_penalty,
+            "btc_bonus": btc_bonus,
+            "liquidity_bonus": liquidity_bonus,
         }
 
         return TokenAnalysis(
@@ -474,6 +628,11 @@ class ClobAnalyzer:
             parent_url=parent_url,
             outcome=outcome,
             token_id=token_id,
+            end_date=parent_end_date,
+            days_to_resolution=days_to_resolution,
+            liquidity=parent_liquidity,
+            volume=parent_volume,
+            btc_relevance_score=btc_relevance_score,
             midpoint=midpoint,
             buy_price=buy_price,
             sell_price=sell_price,
@@ -494,6 +653,9 @@ class ClobAnalyzer:
             pump_penalty=pump_penalty,
             midpoint_penalty=midpoint_penalty,
             spread_penalty=spread_penalty,
+            time_penalty=time_penalty,
+            btc_bonus=btc_bonus,
+            liquidity_bonus=liquidity_bonus,
             score=score,
             ranking_reason=ranking_reason,
         )
@@ -523,6 +685,14 @@ class ClobAnalyzer:
             parent_question = market.get("question")
             parent_event_title = market.get("event_title")
             parent_url = market.get("url")
+            parent_end_date = (
+                market.get("end_date")
+                or market.get("endDate")
+                or market.get("end_date_iso")
+                or market.get("resolve_date")
+            )
+            parent_liquidity = self._to_float(market.get("liquidity"))
+            parent_volume = self._to_float(market.get("volume"))
 
             yes_token_id = market.get("yes_token_id")
             no_token_id = market.get("no_token_id")
@@ -535,6 +705,9 @@ class ClobAnalyzer:
                     parent_question=parent_question,
                     parent_event_title=parent_event_title,
                     parent_url=parent_url,
+                    parent_end_date=parent_end_date,
+                    parent_liquidity=parent_liquidity,
+                    parent_volume=parent_volume,
                     interval=interval,
                     fidelity=fidelity,
                 )
@@ -549,6 +722,9 @@ class ClobAnalyzer:
                     parent_question=parent_question,
                     parent_event_title=parent_event_title,
                     parent_url=parent_url,
+                    parent_end_date=parent_end_date,
+                    parent_liquidity=parent_liquidity,
+                    parent_volume=parent_volume,
                     interval=interval,
                     fidelity=fidelity,
                 )
@@ -581,6 +757,11 @@ class ClobAnalyzer:
             print(f"    Event                  : {item.parent_event_title}")
             print(f"    URL                    : {item.parent_url}")
             print(f"    Token ID               : {item.token_id}")
+            print(f"    End date               : {item.end_date}")
+            print(f"    Days to resolution     : {item.days_to_resolution}")
+            print(f"    Liquidity              : {item.liquidity}")
+            print(f"    Volume                 : {item.volume}")
+            print(f"    BTC relevance score    : {item.btc_relevance_score}")
             print(f"    Midpoint               : {item.midpoint}")
             print(f"    Best BUY price         : {item.buy_price}")
             print(f"    Best SELL price        : {item.sell_price}")
@@ -598,6 +779,9 @@ class ClobAnalyzer:
             print(f"    Pump penalty           : {item.pump_penalty}")
             print(f"    Midpoint penalty       : {item.midpoint_penalty}")
             print(f"    Spread penalty         : {item.spread_penalty}")
+            print(f"    Time penalty           : {item.time_penalty}")
+            print(f"    BTC bonus              : {item.btc_bonus}")
+            print(f"    Liquidity bonus        : {item.liquidity_bonus}")
             print(f"    Score                  : {item.score:.4f}")
             print("-" * 100)
 
