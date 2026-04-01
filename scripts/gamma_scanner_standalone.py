@@ -6,12 +6,87 @@ import sys
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
 
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+LOGS_DIR = PROJECT_ROOT / "logs"
+
 GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
+WATCH_STATE_PATH = LOGS_DIR / "watch_state.json"
+
+RAW_OUTPUT_PATH = PROJECT_ROOT / "gamma_scan_results_raw.json"
+FILTERED_OUTPUT_PATH = PROJECT_ROOT / "gamma_scan_results_filtered.json"
+
+
+CRYPTO_KEYWORDS = [
+    "bitcoin",
+    "btc",
+    "xbt",
+    "ethereum",
+    "eth",
+    "solana",
+    "sol",
+    "ripple",
+    "xrp",
+    "dogecoin",
+    "doge",
+    "cardano",
+    "ada",
+    "avalanche",
+    "avax",
+    "tron",
+    "trx",
+    "chainlink",
+    "link",
+    "litecoin",
+    "ltc",
+    "sui",
+    "aptos",
+    "arb",
+    "arbitrum",
+    "optimism",
+    "op",
+    "crypto",
+    "cryptocurrency",
+    "stablecoin",
+    "defi",
+    "nft",
+    "memecoin",
+    "meme coin",
+    "altcoin",
+    "token",
+    "coin",
+    "coins",
+    "etf",
+    "spot etf",
+    "bitcoin etf",
+    "ether etf",
+    "halving",
+    "all time high",
+    "ath",
+    "fdv",
+    "market cap",
+    "staking",
+    "onchain",
+    "on-chain",
+    "binance",
+    "coinbase",
+    "blackrock",
+    "grayscale",
+]
+
+
+@dataclass
+class WatchState:
+    watched_token_id: str = ""
+    watched_market_name: str = ""
+    watched_outcome: str = ""
+    watched_score: float = 0.0
+    updated_at: str = ""
 
 
 @dataclass
@@ -53,7 +128,7 @@ class GammaScanner:
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "gamma-scanner-standalone/2.0",
+                "User-Agent": "gamma-scanner-standalone/3.0",
             }
         )
 
@@ -109,7 +184,7 @@ class GammaScanner:
         if not date_str:
             return None
         try:
-            return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            return datetime.fromisoformat(str(date_str).replace("Z", "+00:00"))
         except Exception:
             return None
 
@@ -137,6 +212,29 @@ class GammaScanner:
             + (0.5 if active_ok else 0.0)
         )
 
+    @staticmethod
+    def _market_text(event: Dict[str, Any], market: Dict[str, Any]) -> str:
+        parts = [
+            str(event.get("title") or ""),
+            str(event.get("name") or ""),
+            str(event.get("ticker") or ""),
+            str(event.get("slug") or ""),
+            str(event.get("category") or ""),
+            str(event.get("subcategory") or ""),
+            str(market.get("question") or ""),
+            str(market.get("title") or ""),
+            str(market.get("name") or ""),
+            str(market.get("slug") or ""),
+            str(market.get("description") or ""),
+            str(market.get("category") or ""),
+            str(market.get("subcategory") or ""),
+        ]
+        return " ".join(parts).lower().strip()
+
+    def _is_crypto_market(self, event: Dict[str, Any], market: Dict[str, Any]) -> bool:
+        text = self._market_text(event, market)
+        return any(keyword in text for keyword in CRYPTO_KEYWORDS)
+
     def fetch_active_events(
         self,
         page_size: int = 100,
@@ -146,7 +244,7 @@ class GammaScanner:
         events: List[Dict[str, Any]] = []
         offset = 0
 
-        for _ in range(max_pages):
+        for page in range(1, max_pages + 1):
             params = {
                 "active": "true",
                 "closed": "false",
@@ -154,6 +252,7 @@ class GammaScanner:
                 "offset": offset,
             }
 
+            print(f"Scanning Gamma page {page} with offset={offset}")
             batch = self._get("/events", params=params)
 
             if not isinstance(batch, list):
@@ -177,8 +276,12 @@ class GammaScanner:
     def flatten_events_to_markets(
         self,
         events: List[Dict[str, Any]],
+        crypto_only: bool = True,
     ) -> List[MarketRow]:
         results: List[MarketRow] = []
+
+        total_markets_seen = 0
+        crypto_markets_seen = 0
 
         for event in events:
             event_id = self._first_non_empty(event, ["id", "event_id"])
@@ -190,6 +293,13 @@ class GammaScanner:
                 continue
 
             for market in markets:
+                total_markets_seen += 1
+
+                if crypto_only and not self._is_crypto_market(event, market):
+                    continue
+
+                crypto_markets_seen += 1
+
                 active = self._to_bool(self._first_non_empty(market, ["active"]))
                 closed = self._to_bool(self._first_non_empty(market, ["closed"]))
                 archived = self._to_bool(self._first_non_empty(market, ["archived"]))
@@ -230,8 +340,8 @@ class GammaScanner:
                     yes_token = self._extract_token(tokens, "yes")
                     no_token = self._extract_token(tokens, "no")
 
-                    yes_token_id = yes_token.get("token_id")
-                    no_token_id = no_token.get("token_id")
+                    yes_token_id = yes_token.get("token_id") or yes_token.get("tokenId")
+                    no_token_id = no_token.get("token_id") or no_token.get("tokenId")
 
                     if yes_token.get("price") is not None:
                         try:
@@ -272,6 +382,7 @@ class GammaScanner:
                     "volume_24hr": volume_24hr,
                     "enable_order_book": enable_order_book,
                     "active": active,
+                    "crypto_match": True,
                 }
 
                 results.append(
@@ -302,6 +413,13 @@ class GammaScanner:
                         ranking_reason=ranking_reason,
                     )
                 )
+
+        print()
+        print("DISCOVERY SUMMARY")
+        print("=" * 80)
+        print(f"Total markets scanned : {total_markets_seen}")
+        print(f"Crypto markets found  : {crypto_markets_seen}")
+        print("=" * 80)
 
         return results
 
@@ -361,13 +479,17 @@ class GammaScanner:
         require_future_end_date: bool = True,
         exclude_keywords: Optional[List[str]] = None,
         top_n: int = 15,
+        crypto_only: bool = True,
     ) -> Dict[str, List[MarketRow]]:
         events = self.fetch_active_events(
             page_size=page_size,
             max_pages=max_pages,
         )
 
-        raw_markets = self.flatten_events_to_markets(events)
+        raw_markets = self.flatten_events_to_markets(
+            events=events,
+            crypto_only=crypto_only,
+        )
 
         filtered_markets = self.filter_markets(
             markets=raw_markets,
@@ -405,14 +527,16 @@ def print_markets(markets: List[MarketRow], title: str) -> None:
         print("-" * 100)
 
 
-def save_json(markets: List[MarketRow], filename: str) -> None:
-    with open(filename, "w", encoding="utf-8") as f:
+def save_json(markets: List[MarketRow], filename: Path) -> None:
+    with filename.open("w", encoding="utf-8") as f:
         json.dump([asdict(m) for m in markets], f, ensure_ascii=False, indent=2)
     print(f"JSON gravado em: {filename}")
 
 
 if __name__ == "__main__":
     try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
         scanner = GammaScanner()
 
         result = scanner.scan(
@@ -428,14 +552,15 @@ if __name__ == "__main__":
                 "2028 us presidential election",
             ],
             top_n=200,
+            crypto_only=True,
         )
 
         raw_markets = result["raw"]
         filtered_markets = result["filtered"]
 
         print_markets(filtered_markets, "Encontrados")
-        save_json(raw_markets, "gamma_scan_results_raw.json")
-        save_json(filtered_markets, "gamma_scan_results_filtered.json")
+        save_json(raw_markets, RAW_OUTPUT_PATH)
+        save_json(filtered_markets, FILTERED_OUTPUT_PATH)
 
     except requests.HTTPError as e:
         print(f"Erro HTTP: {e}", file=sys.stderr)
