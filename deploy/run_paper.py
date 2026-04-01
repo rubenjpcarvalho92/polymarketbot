@@ -40,7 +40,6 @@ from strategies.rsi_vwap import RsiVwapStrategy
 
 LOGS_DIR = PROJECT_ROOT / "logs"
 TOKEN_ANALYSIS_JSON = PROJECT_ROOT / "token_analysis_results.json"
-GAMMA_FILTERED_JSON = PROJECT_ROOT / "gamma_scan_results_filtered.json"
 WATCH_STATE_PATH = LOGS_DIR / "watch_state.json"
 
 MIN_API_HISTORY_POINTS = 20
@@ -228,7 +227,6 @@ def compute_btc_relevance_score(market_name: str) -> float:
         return 0.0
 
     score = 0.0
-
     if "bitcoin" in normalized:
         score += 0.50
     if "btc" in normalized:
@@ -392,6 +390,14 @@ def fetch_last_trade_price(config: AppConfig, token_id: str) -> dict:
     except Exception as exc:
         print(f"WARNING: last-trade-price fetch failed for token {token_id}: {exc}")
         return {"price": 0.0, "side": ""}
+
+
+def fetch_order_book_safe(client: PolymarketClient, token_id: str):
+    try:
+        return client.get_order_book(token_id)
+    except Exception as exc:
+        print(f"WARNING: order book fetch failed for token {token_id}: {exc}")
+        return None
 
 
 def fetch_prices_history_from_api(
@@ -613,68 +619,23 @@ def load_candidates_from_json(max_candidates: int = 10) -> list[CandidateToken]:
     return candidates
 
 
-def basic_buy_candidate_filter(candidate: CandidateToken) -> tuple[bool, str]:
-    if not is_btc_market_name(candidate.market_name):
-        return False, "not_btc_market"
-
-    if candidate.days_to_resolution < NEW_ENTRY_MIN_DAYS:
-        return False, "too_close_to_resolution"
-
-    if candidate.days_to_resolution > NEW_ENTRY_MAX_DAYS:
-        return False, "too_far_from_resolution"
-
-    if candidate.midpoint <= 0:
-        return False, "missing_midpoint"
-
-    if candidate.midpoint < 0.10 or candidate.midpoint > 0.90:
-        return False, "midpoint_outside_buy_range"
-
-    if candidate.spread <= 0:
-        return False, "missing_spread"
-
-    if candidate.spread > 0.02:
-        return False, "spread_too_wide"
-
-    if candidate.history_points < 12:
-        return False, "not_enough_history"
-
-    if candidate.return_pct < -10:
-        return False, "return_too_negative"
-
-    if candidate.trend_consistency > 0 and candidate.trend_consistency < 0.40:
-        return False, "trend_consistency_too_low"
-
-    if candidate.final_score <= 0:
-        return False, "final_score_too_low"
-
-    return True, "candidate_ok"
-
-
 def is_candidate_still_watchable(candidate: Optional[CandidateToken]) -> tuple[bool, str]:
     if candidate is None:
         return False, "missing_candidate"
-
     if not is_btc_market_name(candidate.market_name):
         return False, "not_btc_market"
-
     if candidate.days_to_resolution <= FORCE_EXIT_DAYS:
         return False, "too_close_to_resolution"
-
     if candidate.days_to_resolution > NEW_ENTRY_MAX_DAYS:
         return False, "too_far_from_resolution"
-
     if candidate.midpoint <= 0:
         return False, "missing_midpoint"
-
     if candidate.midpoint < 0.10 or candidate.midpoint > 0.90:
         return False, "midpoint_outside_range"
-
     if candidate.spread <= 0 or candidate.spread > 0.02:
         return False, "spread_invalid"
-
     if candidate.final_score <= 0:
         return False, "score_too_low"
-
     return True, "watchable"
 
 
@@ -794,12 +755,16 @@ def evaluate_token(
     outcome: str,
     position_sizer: PositionSizer,
     position_state: PositionSizingState,
-) -> dict:
+) -> Optional[dict]:
     clob_host = get_public_clob_host(config)
 
     spread = fetch_spread(config, token_id)
     last_trade = fetch_last_trade_price(config, token_id)
-    book = client.get_order_book(token_id)
+    book = fetch_order_book_safe(client, token_id)
+
+    if book is None:
+        print(f"WARNING: skipping token without order book: {token_id}")
+        return None
 
     history_path = bootstrap_history_file_from_api(
         logs_dir=LOGS_DIR,
@@ -846,10 +811,9 @@ def evaluate_token(
         history_source = "synthetic_fallback"
         market_data = build_fake_history_from_orderbook(book.best_bid, book.best_ask)
 
-    pre_trade_signal_strength = "medium"
     calculated_order_size = position_sizer.calculate_order_size(
         state=position_state,
-        signal_strength=pre_trade_signal_strength,
+        signal_strength="medium",
     )
 
     context = StrategyContext(
@@ -859,6 +823,8 @@ def evaluate_token(
     )
 
     result = None
+    local_trader = None
+
     if calculated_order_size > 0:
         local_trader = build_trader(config, client)
         result = local_trader.process_market(
@@ -869,8 +835,6 @@ def evaluate_token(
             order_size=calculated_order_size,
             token_id=token_id,
         )
-    else:
-        local_trader = None
 
     midpoint = (book.best_bid + book.best_ask) / 2 if book.best_bid > 0 and book.best_ask > 0 else 0.0
 
@@ -933,14 +897,39 @@ def print_portfolio_snapshot(portfolio_snapshot: dict) -> None:
         print(f"{key}: {value}")
 
 
+def print_open_orders_and_positions(trader_for_final) -> None:
+    print("Open orders")
+    print("-----------")
+    if (
+        trader_for_final is not None
+        and getattr(trader_for_final, "order_manager", None) is not None
+        and getattr(trader_for_final.order_manager, "orders", None) is not None
+    ):
+        for order in trader_for_final.order_manager.orders.values():
+            print(order)
+    else:
+        print("No order manager / no open orders")
+
+    print()
+    print("Positions")
+    print("---------")
+    if (
+        trader_for_final is not None
+        and getattr(trader_for_final, "state", None) is not None
+        and getattr(trader_for_final.state, "positions", None) is not None
+    ):
+        for market_id, position in trader_for_final.state.positions.items():
+            print(market_id, position)
+    else:
+        print("No trader state / no positions")
+
+
 def main() -> None:
     config = load_config()
 
-    starting_cash = config.trading.paper_starting_cash
-
     portfolio = PaperPortfolio.load(
         "logs/portfolio_state.json",
-        starting_cash=starting_cash,
+        starting_cash=config.trading.paper_starting_cash,
     )
 
     risk_config = build_position_sizer_config(config)
@@ -955,7 +944,7 @@ def main() -> None:
     print(f"Strategy             : {config.trading.strategy_name}")
     print(f"Position sizing mode : {risk_config.mode.value}")
     print(f"Default order size   : {config.trading.default_order_size}")
-    print(f"Starting cash        : {starting_cash}")
+    print(f"Starting cash        : {config.trading.paper_starting_cash}")
     print(f"Equity before cycle  : {position_state.current_balance}")
     print(f"Open exposure        : {position_state.open_exposure}")
     print()
@@ -995,92 +984,90 @@ def main() -> None:
         candidates = all_candidates[:10]
 
         if not candidates:
-            if not config.trading.default_token_id:
-                print("Nenhum candidato válido no JSON e DEFAULT_TOKEN_ID está vazio.")
-                print()
-                print_portfolio_snapshot(portfolio_snapshot_before)
-                return
-
-            print("Sem candidatos no JSON. A usar DEFAULT_TOKEN_ID como fallback.")
+            print("Nenhum candidato BTC elegível encontrado neste ciclo.")
             print()
-            selected_token_id = config.trading.default_token_id
-            selected_market_name = selected_token_id
-            selected_outcome = ""
-        else:
-            print("Watch candidate selection")
-            print("-------------------------")
+            print_portfolio_snapshot(portfolio_snapshot_before)
+            return
 
-            watched_candidate, new_watch_state, watch_reason = choose_watched_candidate(
-                watch_state=watch_state,
-                candidates=candidates,
-            )
-            save_watch_state(new_watch_state)
+        print("Watch candidate selection")
+        print("-------------------------")
 
-            print(f"Watch decision       : {watch_reason}")
-            print(f"Watched token ID     : {new_watch_state.watched_token_id}")
-            print(f"Watched market       : {new_watch_state.watched_market_name}")
-            print(f"Watched outcome      : {new_watch_state.watched_outcome}")
-            print(f"Watched score        : {new_watch_state.watched_score}")
+        watched_candidate, new_watch_state, watch_reason = choose_watched_candidate(
+            watch_state=watch_state,
+            candidates=candidates,
+        )
+        save_watch_state(new_watch_state)
+
+        print(f"Watch decision       : {watch_reason}")
+        print(f"Watched token ID     : {new_watch_state.watched_token_id}")
+        print(f"Watched market       : {new_watch_state.watched_market_name}")
+        print(f"Watched outcome      : {new_watch_state.watched_outcome}")
+        print(f"Watched score        : {new_watch_state.watched_score}")
+        print()
+
+        if watched_candidate is None:
+            print("Nenhum mercado observável encontrado neste ciclo.")
+            print_portfolio_snapshot(portfolio_snapshot_before)
+            return
+
+        selected_candidate = watched_candidate
+
+        selected_evaluation = evaluate_token(
+            config=config,
+            client=client,
+            token_id=selected_candidate.token_id,
+            market_name=selected_candidate.market_name,
+            outcome=selected_candidate.outcome,
+            position_sizer=position_sizer,
+            position_state=position_state,
+        )
+
+        if selected_evaluation is None:
+            print("Mercado observado sem order book válido neste ciclo.")
+            print_portfolio_snapshot(portfolio_snapshot_before)
+            return
+
+        result = selected_evaluation["result"]
+        book = selected_evaluation["book"]
+        spread = selected_evaluation["spread"]
+        last_trade = selected_evaluation["last_trade"]
+
+        print("Watched market evaluation")
+        print("-------------------------")
+        print(f"Market               : {selected_candidate.market_name} [{selected_candidate.outcome}]")
+        print(f"Token ID             : {selected_candidate.token_id}")
+        print(f"Final score          : {selected_candidate.final_score}")
+        print(f"Days to resolution   : {selected_candidate.days_to_resolution:.2f}")
+        print(f"Midpoint             : {selected_candidate.midpoint}")
+        print(f"Spread               : {selected_candidate.spread}")
+        print(f"Live best_bid        : {book.best_bid}")
+        print(f"Live best_ask        : {book.best_ask}")
+        print(f"Live spread          : {spread}")
+        print(f"Last trade px        : {last_trade['price']}")
+        print(f"Last trade side      : {last_trade['side']}")
+        print(f"History source       : {selected_evaluation['history_source']}")
+        print(f"API hist points      : {selected_evaluation['api_history_points']}")
+        print(f"API hist enough      : {selected_evaluation['api_history_enough']}")
+        print(f"API fidelity         : {selected_evaluation['api_history_fidelity']}")
+        print(f"History file         : {selected_evaluation['history_path'].name}")
+        print(f"Calc order size      : {selected_evaluation['calculated_order_size']}")
+        print(f"Strategy result      : {result}")
+        print()
+
+        if result is None:
+            print("Sem resultado da estratégia neste ciclo.")
+            print_portfolio_snapshot(portfolio_snapshot_before)
+            return
+
+        if result.signal.value != "BUY":
+            print("Mercado observado continua em espera. Ainda sem BUY.")
             print()
+            print_portfolio_snapshot(portfolio_snapshot_before)
+            return
 
-            if watched_candidate is None:
-                print("Nenhum mercado observável encontrado neste ciclo.")
-                print_portfolio_snapshot(portfolio_snapshot_before)
-                return
-
-            selected_candidate = watched_candidate
-
-            selected_evaluation = evaluate_token(
-                config=config,
-                client=client,
-                token_id=selected_candidate.token_id,
-                market_name=selected_candidate.market_name,
-                outcome=selected_candidate.outcome,
-                position_sizer=position_sizer,
-                position_state=position_state,
-            )
-
-            result = selected_evaluation["result"]
-            book = selected_evaluation["book"]
-            spread = selected_evaluation["spread"]
-            last_trade = selected_evaluation["last_trade"]
-
-            print("Watched market evaluation")
-            print("-------------------------")
-            print(f"Market               : {selected_candidate.market_name} [{selected_candidate.outcome}]")
-            print(f"Token ID             : {selected_candidate.token_id}")
-            print(f"Final score          : {selected_candidate.final_score}")
-            print(f"Days to resolution   : {selected_candidate.days_to_resolution:.2f}")
-            print(f"Midpoint             : {selected_candidate.midpoint}")
-            print(f"Spread               : {selected_candidate.spread}")
-            print(f"Live best_bid        : {book.best_bid}")
-            print(f"Live best_ask        : {book.best_ask}")
-            print(f"Live spread          : {spread}")
-            print(f"Last trade px        : {last_trade['price']}")
-            print(f"Last trade side      : {last_trade['side']}")
-            print(f"History source       : {selected_evaluation['history_source']}")
-            print(f"API hist points      : {selected_evaluation['api_history_points']}")
-            print(f"API hist enough      : {selected_evaluation['api_history_enough']}")
-            print(f"API fidelity         : {selected_evaluation['api_history_fidelity']}")
-            print(f"History file         : {selected_evaluation['history_path'].name}")
-            print(f"Calc order size      : {selected_evaluation['calculated_order_size']}")
-            print(f"Strategy result      : {result}")
-            print()
-
-            if result is None:
-                print("Sem resultado da estratégia neste ciclo.")
-                print_portfolio_snapshot(portfolio_snapshot_before)
-                return
-
-            if result.signal.value != "BUY":
-                print("Mercado observado continua em espera. Ainda sem BUY.")
-                print()
-                print_portfolio_snapshot(portfolio_snapshot_before)
-                return
-
-            selected_token_id = selected_candidate.token_id
-            selected_market_name = selected_candidate.market_name
-            selected_outcome = selected_candidate.outcome
+        selected_token_id = selected_candidate.token_id
+        selected_market_name = selected_candidate.market_name
+        selected_outcome = selected_candidate.outcome
 
     if not selected_token_id:
         print("No token selected.")
@@ -1096,6 +1083,10 @@ def main() -> None:
             position_sizer=position_sizer,
             position_state=position_state,
         )
+        if final_evaluation is None:
+            print("Token selecionado sem order book válido.")
+            print_portfolio_snapshot(portfolio_snapshot_before)
+            return
     else:
         final_evaluation = selected_evaluation
 
@@ -1156,18 +1147,7 @@ def main() -> None:
     print(result)
     print()
 
-    print("Open orders")
-    print("-----------")
-    if trader_for_final is not None:
-        for order in trader_for_final.order_manager.orders.values():
-            print(order)
-
-    print()
-    print("Positions")
-    print("---------")
-    if trader_for_final is not None:
-        for market_id, position in trader_for_final.state.positions.items():
-            print(market_id, position)
+    print_open_orders_and_positions(trader_for_final)
 
     signal_strength = get_signal_strength(result)
 
@@ -1200,42 +1180,40 @@ def main() -> None:
 
     timestamp_utc = datetime.now(timezone.utc).isoformat()
 
-    cycle_fields = [
-        "market_name",
-        "outcome",
-        "spread",
-        "last_trade_price",
-        "last_trade_side",
-        "timestamp",
-        "token_id",
-        "strategy",
-        "position_sizing_mode",
-        "signal_strength",
-        "best_bid",
-        "best_ask",
-        "bid_size",
-        "ask_size",
-        "midpoint",
-        "signal",
-        "reason",
-        "position_side",
-        "limit_price",
-        "order_size",
-        "order_status",
-        "starting_cash",
-        "cash_balance",
-        "invested_value",
-        "market_value",
-        "realized_pnl",
-        "unrealized_pnl",
-        "equity_total",
-        "total_pnl",
-        "return_pct",
-    ]
-
     append_csv_row(
         "logs/cycles.csv",
-        cycle_fields,
+        [
+            "market_name",
+            "outcome",
+            "spread",
+            "last_trade_price",
+            "last_trade_side",
+            "timestamp",
+            "token_id",
+            "strategy",
+            "position_sizing_mode",
+            "signal_strength",
+            "best_bid",
+            "best_ask",
+            "bid_size",
+            "ask_size",
+            "midpoint",
+            "signal",
+            "reason",
+            "position_side",
+            "limit_price",
+            "order_size",
+            "order_status",
+            "starting_cash",
+            "cash_balance",
+            "invested_value",
+            "market_value",
+            "realized_pnl",
+            "unrealized_pnl",
+            "equity_total",
+            "total_pnl",
+            "return_pct",
+        ],
         {
             "market_name": selected_market_name,
             "outcome": selected_outcome,
@@ -1262,29 +1240,27 @@ def main() -> None:
         },
     )
 
-    trade_fields = [
-        "timestamp",
-        "market_name",
-        "outcome",
-        "token_id",
-        "side",
-        "price",
-        "size",
-        "position_sizing_mode",
-        "signal_strength",
-        "order_status",
-        "cash_balance",
-        "invested_value",
-        "market_value",
-        "unrealized_pnl",
-        "equity_total",
-        "return_pct",
-    ]
-
     if order_status == "FILLED":
         append_csv_row(
             "logs/trades.csv",
-            trade_fields,
+            [
+                "timestamp",
+                "market_name",
+                "outcome",
+                "token_id",
+                "side",
+                "price",
+                "size",
+                "position_sizing_mode",
+                "signal_strength",
+                "order_status",
+                "cash_balance",
+                "invested_value",
+                "market_value",
+                "unrealized_pnl",
+                "equity_total",
+                "return_pct",
+            ],
             {
                 "timestamp": timestamp_utc,
                 "market_name": selected_market_name,
@@ -1305,22 +1281,20 @@ def main() -> None:
             },
         )
 
-    portfolio_fields = [
-        "timestamp",
-        "starting_cash",
-        "cash_balance",
-        "invested_value",
-        "market_value",
-        "realized_pnl",
-        "unrealized_pnl",
-        "equity_total",
-        "total_pnl",
-        "return_pct",
-    ]
-
     append_csv_row(
         "logs/portfolio.csv",
-        portfolio_fields,
+        [
+            "timestamp",
+            "starting_cash",
+            "cash_balance",
+            "invested_value",
+            "market_value",
+            "realized_pnl",
+            "unrealized_pnl",
+            "equity_total",
+            "total_pnl",
+            "return_pct",
+        ],
         {
             "timestamp": timestamp_utc,
             **portfolio_snapshot,

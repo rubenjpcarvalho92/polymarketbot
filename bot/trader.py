@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 class Signal(str, Enum):
@@ -19,6 +19,11 @@ class StrategyResult:
 
 
 @dataclass
+class OrderManagerState:
+    orders: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class TraderState:
     positions: Dict[str, Any] = field(default_factory=dict)
 
@@ -32,12 +37,6 @@ class Trader:
       - process_market(...)
       - order_manager
       - state
-
-    Objetivo:
-      - correr a strategy escolhida
-      - enriquecer metadata
-      - tentar executar via execution_engine quando houver BUY/SELL
-      - manter compatibilidade mesmo se execution_engine / strategy tiverem APIs ligeiramente diferentes
     """
 
     def __init__(
@@ -49,9 +48,17 @@ class Trader:
         self.strategies = strategies or {}
         self.execution_engine = execution_engine
 
-        # Compatibilidade com o resto do projeto
         self.order_manager = getattr(execution_engine, "order_manager", None)
-        self.state = getattr(execution_engine, "state", TraderState())
+        if self.order_manager is None:
+            self.order_manager = OrderManagerState()
+        elif getattr(self.order_manager, "orders", None) is None:
+            self.order_manager.orders = {}
+
+        self.state = getattr(execution_engine, "state", None)
+        if self.state is None:
+            self.state = TraderState()
+        elif getattr(self.state, "positions", None) is None:
+            self.state.positions = {}
 
     def _normalize_signal(self, value: Any) -> Signal:
         if isinstance(value, Signal):
@@ -63,6 +70,13 @@ class Trader:
         if text == "SELL":
             return Signal.SELL
         return Signal.HOLD
+
+    def _default_side_for_signal(self, signal: Signal) -> str:
+        if signal == Signal.BUY:
+            return "BUY"
+        if signal == Signal.SELL:
+            return "SELL"
+        return ""
 
     def _coerce_strategy_result(self, raw_result: Any) -> StrategyResult:
         if raw_result is None:
@@ -105,7 +119,6 @@ class Trader:
                 metadata={},
             )
 
-        # Tenta vários nomes de método para compatibilidade
         raw_result = None
 
         if hasattr(strategy, "generate_signal"):
@@ -156,14 +169,13 @@ class Trader:
         best_ask: float,
         order_size: float,
     ) -> StrategyResult:
-        """
-        Tenta executar a ordem usando diferentes formatos de API do execution_engine.
-        """
         metadata = dict(signal_result.metadata or {})
         metadata.setdefault("token_id", token_id)
         metadata.setdefault("best_bid", best_bid)
         metadata.setdefault("best_ask", best_ask)
         metadata.setdefault("order_size_requested", order_size)
+        metadata.setdefault("side", self._default_side_for_signal(signal_result.signal))
+        metadata.setdefault("position_side", metadata.get("side", ""))
 
         if self.execution_engine is None:
             metadata.setdefault("order_status", "NOT_EXECUTED")
@@ -174,7 +186,6 @@ class Trader:
             )
 
         try:
-            # API 1: execute_signal(signal=..., token_id=..., best_bid=..., best_ask=..., order_size=..., metadata=...)
             if hasattr(self.execution_engine, "execute_signal"):
                 executed = self.execution_engine.execute_signal(
                     signal=signal_result.signal.value,
@@ -186,7 +197,6 @@ class Trader:
                 )
                 return self._merge_execution_result(signal_result, executed, metadata)
 
-            # API 2: execute_trade(...)
             if hasattr(self.execution_engine, "execute_trade"):
                 executed = self.execution_engine.execute_trade(
                     signal=signal_result.signal.value,
@@ -198,7 +208,6 @@ class Trader:
                 )
                 return self._merge_execution_result(signal_result, executed, metadata)
 
-            # API 3: place_order(...)
             if hasattr(self.execution_engine, "place_order"):
                 side = metadata.get("side") or metadata.get("position_side") or signal_result.signal.value
                 executed = self.execution_engine.place_order(
@@ -245,18 +254,20 @@ class Trader:
         if isinstance(executed, StrategyResult):
             executed.signal = self._normalize_signal(executed.signal)
             executed.metadata = executed.metadata or {}
+            executed.metadata.setdefault("order_status", "UNKNOWN")
             return executed
 
         if hasattr(executed, "signal") and hasattr(executed, "reason"):
             coerced = self._coerce_strategy_result(executed)
             coerced.metadata = coerced.metadata or {}
-            if "order_status" not in coerced.metadata:
-                coerced.metadata["order_status"] = "UNKNOWN"
+            coerced.metadata.setdefault("order_status", "UNKNOWN")
             return coerced
 
         metadata = dict(fallback_metadata)
         if isinstance(executed, dict):
             metadata.update(executed)
+        else:
+            metadata["raw_execution_result"] = executed
 
         metadata.setdefault("order_status", "UNKNOWN")
 
@@ -276,9 +287,6 @@ class Trader:
         order_size: float,
         token_id: str,
     ) -> StrategyResult:
-        """
-        Método esperado pelo run_paper.py
-        """
         strategy_result = self._run_strategy(
             strategy_name=strategy_name,
             context=context,
