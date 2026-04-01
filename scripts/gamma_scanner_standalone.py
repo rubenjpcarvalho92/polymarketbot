@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sys
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -27,29 +28,19 @@ CRYPTO_KEYWORDS = [
     "btc",
     "xbt",
     "ethereum",
-    "eth",
+    "ether",
     "solana",
-    "sol",
     "ripple",
-    "xrp",
     "dogecoin",
-    "doge",
     "cardano",
-    "ada",
     "avalanche",
-    "avax",
     "tron",
-    "trx",
     "chainlink",
-    "link",
     "litecoin",
-    "ltc",
     "sui",
     "aptos",
-    "arb",
     "arbitrum",
     "optimism",
-    "op",
     "crypto",
     "cryptocurrency",
     "stablecoin",
@@ -58,13 +49,9 @@ CRYPTO_KEYWORDS = [
     "memecoin",
     "meme coin",
     "altcoin",
-    "token",
-    "coin",
-    "coins",
-    "etf",
-    "spot etf",
     "bitcoin etf",
     "ether etf",
+    "spot etf",
     "halving",
     "all time high",
     "ath",
@@ -128,7 +115,7 @@ class GammaScanner:
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "gamma-scanner-standalone/3.0",
+                "User-Agent": "gamma-scanner-standalone/4.0",
             }
         )
 
@@ -229,11 +216,31 @@ class GammaScanner:
             str(market.get("category") or ""),
             str(market.get("subcategory") or ""),
         ]
-        return " ".join(parts).lower().strip()
+        return " ".join(parts).strip()
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        text = text.lower()
+        text = re.sub(r"[^a-z0-9\s\-]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _contains_keyword(self, text: str, keyword: str) -> bool:
+        normalized_text = self._normalize_text(text)
+        normalized_keyword = self._normalize_text(keyword)
+
+        if not normalized_keyword:
+            return False
+
+        if " " in normalized_keyword or "-" in normalized_keyword:
+            return normalized_keyword in normalized_text
+
+        pattern = rf"\b{re.escape(normalized_keyword)}\b"
+        return re.search(pattern, normalized_text) is not None
 
     def _is_crypto_market(self, event: Dict[str, Any], market: Dict[str, Any]) -> bool:
         text = self._market_text(event, market)
-        return any(keyword in text for keyword in CRYPTO_KEYWORDS)
+        return any(self._contains_keyword(text, keyword) for keyword in CRYPTO_KEYWORDS)
 
     def fetch_active_events(
         self,
@@ -551,7 +558,7 @@ if __name__ == "__main__":
                 "2028 presidential nomination",
                 "2028 us presidential election",
             ],
-            top_n=200,
+            top_n=20,
             crypto_only=True,
         )
 
