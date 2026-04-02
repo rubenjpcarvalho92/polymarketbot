@@ -38,10 +38,10 @@ BTC_KEYWORDS = [
     "ath",
 ]
 
-PREFERRED_MIN_DAYS = 2.0
-PREFERRED_MAX_DAYS = 180.0
-MAX_ALLOWED_DAYS = 365.0
-FORCE_EXIT_DAYS = 1.0
+PREFERRED_MIN_DAYS = 1.0
+PREFERRED_MAX_DAYS = 240.0
+MAX_ALLOWED_DAYS = 500.0
+FORCE_EXIT_DAYS = 0.25
 
 
 @dataclass
@@ -98,7 +98,7 @@ class ClobAnalyzer:
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "clob-market-analyzer-standalone/8.0-btc-focused",
+                "User-Agent": "clob-market-analyzer-standalone/9.0-btc-focused",
             }
         )
         self.exclusion_reasons: Counter[str] = Counter()
@@ -335,21 +335,21 @@ class ClobAnalyzer:
     def _midpoint_extreme_penalty(midpoint: Optional[float]) -> float:
         if midpoint is None:
             return 1.5
-        if midpoint < 0.10 or midpoint > 0.90:
+        if midpoint < 0.03 or midpoint > 0.97:
             return 3.0
-        if midpoint < 0.15 or midpoint > 0.85:
-            return 1.25
+        if midpoint < 0.10 or midpoint > 0.90:
+            return 1.0
         return 0.0
 
     @staticmethod
     def _spread_penalty(spread: Optional[float]) -> float:
         if spread is None:
             return 2.0
-        if spread > 0.02:
+        if spread > 0.05:
             return 3.0
-        if spread >= 0.015:
+        if spread >= 0.03:
             return 1.25
-        if spread >= 0.01:
+        if spread >= 0.015:
             return 0.4
         return 0.0
 
@@ -364,19 +364,19 @@ class ClobAnalyzer:
         penalty = 0.0
 
         if return_pct is not None and return_pct > 35 and history_points < 20:
-            penalty += 2.0
-
-        if return_pct is not None and return_pct > 60:
-            penalty += 2.0
-
-        if volatility is not None and volatility > 0.10:
             penalty += 1.5
 
-        if avg_abs_change is not None and avg_abs_change > 0.05:
+        if return_pct is not None and return_pct > 80:
+            penalty += 2.0
+
+        if volatility is not None and volatility > 0.15:
             penalty += 1.0
 
-        if trend_consistency is not None and trend_consistency < 0.50:
-            penalty += 1.25
+        if avg_abs_change is not None and avg_abs_change > 0.08:
+            penalty += 0.8
+
+        if trend_consistency is not None and trend_consistency < 0.25:
+            penalty += 0.8
 
         return penalty
 
@@ -430,33 +430,33 @@ class ClobAnalyzer:
         if midpoint is None:
             return False, "missing_midpoint"
 
-        if midpoint < 0.10 or midpoint > 0.90:
+        if midpoint < 0.03 or midpoint > 0.97:
             return False, "midpoint_too_extreme"
 
         if spread is None:
             return False, "missing_spread"
 
-        if spread > 0.02:
+        if spread > 0.05:
             return False, "spread_too_wide"
 
-        if history_points < 12:
+        if history_points < 8:
             return False, "not_enough_history"
 
-        vol_ok = volatility is not None and volatility > 0.003
-        move_ok = avg_abs_change is not None and avg_abs_change > 0.0015
-        if not (vol_ok and move_ok):
+        vol_ok = volatility is not None and volatility > 0.001
+        move_ok = avg_abs_change is not None and avg_abs_change > 0.0005
+        if not (vol_ok or move_ok):
             return False, "no_meaningful_movement"
 
         if return_pct is None:
             return False, "missing_return"
 
-        if return_pct < -8:
+        if return_pct < -20:
             return False, "return_too_negative"
 
-        if trend_consistency is None or trend_consistency < 0.30:
+        if trend_consistency is None or trend_consistency < 0.15:
             return False, "weak_trend_consistency"
 
-        if return_pct > 80:
+        if return_pct > 120:
             return False, "too_extended"
 
         return True, "eligible"
